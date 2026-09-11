@@ -398,12 +398,14 @@ class ReplicaMetricsManager:
         autoscaling_config: Optional[AutoscalingConfig],
         ingress: bool,
         max_ongoing_requests: int,
+        direct_http: bool = False,
     ):
         self._replica_id = replica_id
         self._deployment_id = replica_id.deployment_id
         self._metrics_pusher = MetricsPusher()
         self._metrics_store = InMemoryMetricsStore()
         self._ingress = ingress
+        self._direct_http = direct_http
         self._controller_handle = ray.get_actor(
             SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE
         )
@@ -570,7 +572,7 @@ class ReplicaMetricsManager:
 
     @property
     def _is_direct_ingress(self) -> bool:
-        return self._ingress and RAY_SERVE_ENABLE_DIRECT_INGRESS
+        return (self._ingress or self._direct_http) and RAY_SERVE_ENABLE_DIRECT_INGRESS
 
     def _should_emit_request_ingress_metrics(self, protocol: RequestProtocol) -> bool:
         # When HAProxy is enabled, http ingress request metrics are emitted by
@@ -1158,6 +1160,7 @@ class Replica:
             autoscaling_config=self._deployment_config.autoscaling_config,
             ingress=ingress,
             max_ongoing_requests=self._deployment_config.max_ongoing_requests,
+            direct_http=self._deployment_config.direct_http,
         )
 
         # Start event loop monitoring for the replica's main event loop.
@@ -2338,7 +2341,11 @@ class Replica:
         if not RAY_SERVE_ENABLE_DIRECT_INGRESS:
             return
 
-        if not self._ingress and not self._is_ingress_request_router:
+        if (
+            not self._ingress
+            and not self._is_ingress_request_router
+            and not self._deployment_config.direct_http
+        ):
             return
 
         async def allocate_and_start_server(start_server_fn, protocol):
@@ -2440,7 +2447,7 @@ class Replica:
             )
 
         # Allocate and start gRPC server for ingress replicas if enabled.
-        # Ingress request router replicas only need HTTP for /internal/route.
+        # Ingress request router and direct HTTP replicas only need HTTP.
         if grpc_enabled:
             self._metrics_manager.enable_grpc_ingress_metrics()
 

@@ -255,6 +255,8 @@ message DeploymentConfig {
   // older controller during a rolling upgrade) falls back to the Python-side
   // defaults.
   BackpressureConfig backpressure_config = 24;
+  // Internal opt-in to HTTP servers on all replicas, including non-ingress replicas.
+  bool direct_http = 25;
 }
 
 // Configuration of the HTTP response returned when a request is rejected due

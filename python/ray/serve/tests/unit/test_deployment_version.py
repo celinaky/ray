@@ -11,6 +11,24 @@ def test_validation():
         DeploymentVersion(123, DeploymentConfig(), {})
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_direct_http_requires_restart(enabled):
+    current = DeploymentVersion("1", DeploymentConfig(direct_http=enabled), {})
+    unchanged = DeploymentVersion("1", DeploymentConfig(direct_http=enabled), {})
+    changed = DeploymentVersion("1", DeploymentConfig(direct_http=not enabled), {})
+
+    assert current == unchanged
+    assert not current.requires_actor_restart(unchanged)
+    assert current != changed
+    assert current.requires_actor_restart(changed)
+    # NOTE: `DeploymentVersion` equality is hash-based and its proto round-trip
+    # is lossy for every config (a plain `DeploymentConfig()` does not survive
+    # it either), so compare the deployment config rather than the version.
+    restored = DeploymentVersion.from_proto(changed.to_proto())
+    assert restored.deployment_config.direct_http == (not enabled)
+    assert current.requires_actor_restart(restored)
+
+
 def test_other_type_equality():
     v = DeploymentVersion("1", DeploymentConfig(), {})
 

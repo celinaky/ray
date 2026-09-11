@@ -160,6 +160,17 @@ def test_autoscaling_config_metrics_interval_s_deprecation_warning() -> None:
 
 
 class TestDeploymentConfig:
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_direct_http_proto_round_trip(self, enabled):
+        config = DeploymentConfig(direct_http=enabled)
+        restored = DeploymentConfig.from_proto_bytes(config.to_proto_bytes())
+        assert restored.direct_http is enabled
+
+    def test_direct_http_defaults_for_old_proto(self):
+        proto = DeploymentConfig(direct_http=True).to_proto()
+        proto.ClearField("direct_http")
+        assert DeploymentConfig.from_proto(proto).direct_http is False
+
     def test_deployment_config_validation(self):
         # Test config ignoring unknown keys (required for forward-compatibility)
         DeploymentConfig(new_version_key=-1)

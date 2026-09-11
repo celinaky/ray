@@ -2,6 +2,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import pytest
+from pydantic import ValidationError
 from fastapi import FastAPI
 
 from ray import serve
@@ -51,6 +52,7 @@ def _build_and_check(
         default_runtime_env=default_runtime_env,
     )
     assert built_app.name == app_name
+    assert all(not d._deployment_config.direct_http for d in built_app.deployments)
     assert built_app.ingress_deployment_name == expected_ingress_name
     assert len(built_app.deployments) == len(expected_deployments)
 
@@ -75,6 +77,138 @@ def _build_and_check(
         )
 
         assert expected_deployment == generated_deployment
+
+
+def test_direct_http_option_preserved_by_copies():
+    @serve.deployment
+    @serve.ingress(FastAPI())
+    class Model:
+        pass
+
+    enabled = Model.options(_direct_http=True)
+    assert not Model._deployment_config.direct_http
+    assert enabled._deployment_config.direct_http
+    assert enabled != Model
+    assert "_direct_http" not in enabled._deployment_config.user_configured_option_names
+
+    copied = enabled.options(name="Renamed", num_replicas=2)
+    assert copied._deployment_config.direct_http
+    assert copied.bind()._bound_deployment._deployment_config.direct_http
+    assert not copied.options(_direct_http=False)._deployment_config.direct_http
+    assert copied._deployment_config.direct_http
+
+
+@pytest.mark.parametrize("value", [None, 1, "true"])
+def test_direct_http_option_requires_bool(value):
+    @serve.deployment
+    class Model:
+        pass
+
+    # `direct_http` is a strict bool on DeploymentConfig, so pydantic rejects
+    # non-bools. ValidationError subclasses ValueError, not TypeError.
+    with pytest.raises(ValidationError, match="valid boolean"):
+        Model.options(_direct_http=value)
+
+
+def test_direct_http_tracks_selected_deployments(monkeypatch):
+    monkeypatch.setattr(
+        "ray.serve._private.build_app.RAY_SERVE_ENABLE_DIRECT_INGRESS", True
+    )
+
+    @serve.deployment
+    class Child:
+        pass
+
+    @serve.deployment
+    @serve.ingress(FastAPI())
+    class Model:
+        pass
+
+    @serve.deployment
+    @serve.ingress(FastAPI())
+    class Ingress:
+        pass
+
+    first = Model.options(_direct_http=True).bind(Child.bind())
+    second = Model.options(_direct_http=True).bind()
+    app = Ingress.bind(first, second, shared=first)
+    built = build_app(
+        app,
+        name="app",
+        route_prefix="/api",
+        make_deployment_handle=FakeDeploymentHandle.from_deployment,
+        default_runtime_env={"env_vars": {"TEST_DIRECT_HTTP": "1"}},
+    )
+
+    assert built.ingress_deployment_name == "Ingress"
+    assert built.route_prefix == "/api"
+    assert len(built.deployments) == 4
+    for deployment in built.deployments:
+        assert deployment._deployment_config.direct_http == (
+            deployment.name in {"Model", "Model_1"}
+        )
+    ingress = next(d for d in built.deployments if d.name == "Ingress")
+    assert ingress.init_args[0] == ingress.init_kwargs["shared"]
+    built.validate_single_fastapi_ingress()
+
+
+def test_direct_http_does_not_exempt_unmarked_asgi_deployments(monkeypatch):
+    monkeypatch.setattr(
+        "ray.serve._private.build_app.RAY_SERVE_ENABLE_DIRECT_INGRESS", True
+    )
+
+    @serve.deployment
+    @serve.ingress(FastAPI())
+    class D:
+        pass
+
+    app = D.options(_direct_http=True).bind(
+        D.bind(), D.options(_direct_http=True).bind()
+    )
+    built = build_app(
+        app, name="app", make_deployment_handle=FakeDeploymentHandle.from_deployment
+    )
+    with pytest.raises(RayServeException, match="multiple FastAPI deployments"):
+        built.validate_single_fastapi_ingress()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_direct_http_validation(monkeypatch, enabled):
+    monkeypatch.setattr(
+        "ray.serve._private.build_app.RAY_SERVE_ENABLE_DIRECT_INGRESS", enabled
+    )
+
+    @serve.deployment
+    class D:
+        pass
+
+    expected = "requires an ASGI deployment" if enabled else "requires direct ingress"
+    with pytest.raises(RayServeException, match=expected):
+        build_app(
+            D.options(_direct_http=True).bind(),
+            name="app",
+            make_deployment_handle=FakeDeploymentHandle.from_deployment,
+        )
+
+
+def test_direct_http_accepts_late_bound_asgi(monkeypatch):
+    monkeypatch.setattr(
+        "ray.serve._private.build_app.RAY_SERVE_ENABLE_DIRECT_INGRESS", True
+    )
+
+    @serve.deployment
+    @serve.ingress()
+    class Model:
+        def __serve_build_asgi_app__(self):
+            return FastAPI()
+
+    built = build_app(
+        Model.options(_direct_http=True).bind(),
+        name="app",
+        make_deployment_handle=FakeDeploymentHandle.from_deployment,
+    )
+    assert built.deployments[0]._deployment_config.direct_http
+    built.validate_single_fastapi_ingress()
 
 
 def test_real_deployment_handle_default():
