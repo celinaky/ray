@@ -1637,6 +1637,18 @@ class Target(BaseModel):
 
 
 @PublicAPI(stability="alpha")
+class HTTPRoute(BaseModel):
+    """Method-aware HTTP route owned by an application ingress."""
+
+    model_config = ConfigDict(frozen=True)
+
+    methods: Optional[List[str]] = Field(
+        default=None, description="Allowed methods, or all methods when unset."
+    )
+    path: str = Field(description="ASGI route pattern relative to the application.")
+
+
+@PublicAPI(stability="alpha")
 class TargetGroup(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -1660,6 +1672,14 @@ class TargetGroup(BaseModel):
     ingress_deployment_name: str = Field(
         "",
         description="Name of the application's ingress deployment.",
+    )
+    ingress_routes: List[HTTPRoute] = Field(
+        default_factory=list,
+        description="Method-aware routes that take priority on the ingress backend.",
+    )
+    direct_targets: Dict[str, List[Target]] = Field(
+        default_factory=dict,
+        description="Direct HTTP targets grouped by deployment name.",
     )
 
 

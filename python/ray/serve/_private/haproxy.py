@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import functools
+import hashlib
 import io
 import json
 import logging
@@ -97,6 +98,7 @@ from ray.serve._private.proxy import (
 from ray.serve._private.utils import get_head_node_id, is_grpc_enabled
 from ray.serve.config import HTTPOptions, gRPCOptions
 from ray.serve.schema import (
+    HTTPRoute,
     LoggingConfig,
     Target,
     TargetGroup,
@@ -140,7 +142,7 @@ def _load_lua_template() -> string.Template:
 def _routers_and_targets_by_backend(
     backends: "List[BackendConfig]",
     local_host: "Optional[str]" = None,
-) -> "Tuple[Dict[str, List[ServerConfig]], Dict[str, List[Tuple[str, str]]]]":
+) -> "Tuple[Dict[str, List[ServerConfig]], Dict[str, Any]]":
     """Per-backend router pool and replica map, restricted to backends with both.
 
     Prefers routers co-located with this HAProxy so the /internal/route hop
@@ -148,13 +150,26 @@ def _routers_and_targets_by_backend(
     is co-located.
     """
     routers: Dict[str, List[ServerConfig]] = {}
-    targets: Dict[str, List[Tuple[str, str]]] = {}
+    targets: Dict[str, Any] = {}
     for backend in backends:
         if not backend.ingress_request_router_servers:
             continue
-        entries = [
-            (s.replica_id, s.name) for s in backend.servers if s.replica_id is not None
-        ]
+        entries: Any
+        if backend.direct_target_configs:
+            entries = {
+                direct.deployment_name: [
+                    (s.replica_id, s.name)
+                    for s in direct.servers
+                    if s.replica_id is not None
+                ]
+                for direct in backend.direct_target_configs
+            }
+        else:
+            entries = [
+                (s.replica_id, s.name)
+                for s in backend.servers
+                if s.replica_id is not None
+            ]
         if not entries:
             continue
         candidates = backend.ingress_request_router_servers
@@ -185,11 +200,31 @@ def _format_routers_lua(routers: "Dict[str, List[ServerConfig]]") -> str:
 
 
 def _format_replica_targets_lua(
-    targets: "Dict[str, List[Tuple[str, str]]]",
+    targets: "Dict[str, Any]",
 ) -> str:
-    """Render {backend_name: {replica_id: server_name}} as nested Lua tables."""
+    """Render legacy or deployment-grouped replica maps as Lua tables."""
     backends_lua = []
     for backend_name, entries in targets.items():
+        if isinstance(entries, dict):
+            deployment_tables = []
+            for deployment_name, deployment_entries in entries.items():
+                inner = ",\n".join(
+                    f"            [{json.dumps(rid)}] = {json.dumps(sname)}"
+                    for rid, sname in deployment_entries
+                )
+                deployment_tables.append(
+                    f"        [{json.dumps(deployment_name)}] = "
+                    + "{\n"
+                    + inner
+                    + "\n        }"
+                )
+            backends_lua.append(
+                f"    [{json.dumps(backend_name)}] = "
+                + "{\n"
+                + ",\n".join(deployment_tables)
+                + "\n    }"
+            )
+            continue
         inner = ",\n".join(
             f"        [{json.dumps(rid)}] = {json.dumps(sname)}"
             for rid, sname in entries
@@ -459,6 +494,24 @@ class ServerConfig:
 
 
 @dataclass
+class DirectTargetConfig:
+    """One deployment-specific data-plane backend."""
+
+    deployment_name: str
+    name: str
+    servers: List[ServerConfig] = field(default_factory=list)
+
+
+@dataclass
+class PriorityRouteConfig:
+    """An ingress-owned route that bypasses the direct request router."""
+
+    name: str
+    methods: List[str]
+    path_regex: str
+
+
+@dataclass
 class BackendConfig:
     """Configuration for a single application backend."""
 
@@ -518,6 +571,15 @@ class BackendConfig:
     # Ingress request router servers. When populated, HAProxy Lua calls
     # /internal/route on one of these to pick a data-plane replica.
     ingress_request_router_servers: List[ServerConfig] = field(default_factory=list)
+
+    # Method/path routes that stay on the application ingress instead of
+    # consulting the request router.
+    ingress_routes: List[HTTPRoute] = field(default_factory=list)
+
+    priority_route_configs: List[PriorityRouteConfig] = field(default_factory=list)
+
+    # Deployment-isolated backends selected by a multi-target request router.
+    direct_target_configs: List[DirectTargetConfig] = field(default_factory=list)
 
     # The fallback server for this backend.
     fallback_server: Optional[ServerConfig] = None
@@ -1025,6 +1087,9 @@ class HAProxyApi(ProxyApi):
         for backend_name, backend_config in self.backend_configs.items():
             for server in backend_config.servers:
                 expected.add((backend_name, server.name))
+            for direct in backend_config.direct_target_configs:
+                for server in direct.servers:
+                    expected.add((direct.name, server.name))
             # The generated config also renders the fallback server as a real
             # `server ... backup` line in the same backend, so it appears in
             # get_all_stats; count it as expected or the gauge never converges
@@ -1069,6 +1134,18 @@ class HAProxyApi(ProxyApi):
                 else backend_name
             )
             backend_config = self.backend_configs.get(base)
+            if backend_config is None:
+                backend_config = next(
+                    (
+                        parent
+                        for parent in self.backend_configs.values()
+                        if any(
+                            direct.name == backend_name
+                            for direct in parent.direct_target_configs
+                        )
+                    ),
+                    None,
+                )
             if (
                 backend_config is None
                 or backend_config.protocol != RequestProtocol.HTTP
@@ -1270,7 +1347,10 @@ class HAProxyApi(ProxyApi):
 
         content = _load_lua_template().substitute(
             TIMEOUT_S=RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_TIMEOUT_S,
-            FORWARD_BODY=str(RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY).lower(),
+            FORWARD_BODY=str(
+                RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY
+                or any(backend.direct_target_configs for backend in backends)
+            ).lower(),
             # HAProxy's req_get_headers() returns lowercase header keys,
             # so lowercase here for the Lua lookup. Empty string disables
             # forwarding entirely.
@@ -1402,6 +1482,9 @@ class HAProxyApi(ProxyApi):
                     ),
                     "ingress_request_router_forward_body": (
                         RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY
+                        or any(
+                            backend.direct_target_configs for backend in http_backends
+                        )
                     ),
                     "ingress_request_router_header_prefix": (
                         SERVE_INGRESS_ROUTER_HEADER_PREFIX
@@ -1473,7 +1556,13 @@ class HAProxyApi(ProxyApi):
             stats_output = await self._send_socket_command("show stat")
             all_stats = self._parse_haproxy_csv_stats(stats_output)
 
-            # Filter to only return application backends (ones in backend_configs)
+            configured_backend_names = set(self.backend_configs)
+            for backend in self.backend_configs.values():
+                configured_backend_names.update(
+                    direct.name for direct in backend.direct_target_configs
+                )
+
+            # Filter to only return application and direct-target backends.
             # Exclude HAProxy internal components like frontends, default_backend, stats
             # Also exclude BACKEND aggregate entries, keep only individual servers
             return {
@@ -1483,7 +1572,7 @@ class HAProxyApi(ProxyApi):
                     if server_name != "BACKEND"
                 }
                 for backend_name, servers in all_stats.items()
-                if backend_name in self.backend_configs
+                if backend_name in configured_backend_names
             }
         except Exception as e:
             logger.error(f"Failed to get HAProxy stats: {e}")
@@ -1650,7 +1739,9 @@ class HAProxyApi(ProxyApi):
         self.backend_configs = backend_configs
 
         self.cfg.has_received_servers = self.cfg.has_received_servers or any(
-            len(bc.servers) > 0 for bc in backend_configs.values()
+            bool(bc.servers)
+            or any(direct.servers for direct in bc.direct_target_configs)
+            for bc in backend_configs.values()
         )
 
     def set_grpc_fallback_server(self, server: Optional[ServerConfig]) -> None:
@@ -2091,13 +2182,45 @@ class HAProxyManager(ProxyActorInterface):
         if fallback_target is not None:
             fallback_server = self._target_to_server(fallback_target)
 
+        backend_name = self._generate_backend_name(target_group)
+        direct_target_configs = []
+        for deployment_name, targets in sorted(target_group.direct_targets.items()):
+            digest = hashlib.sha1(deployment_name.encode()).hexdigest()[:8]
+            direct_target_configs.append(
+                DirectTargetConfig(
+                    deployment_name=deployment_name,
+                    name=self.get_safe_name(
+                        f"{backend_name}-direct-{deployment_name}-{digest}"
+                    ),
+                    servers=[self._target_to_server(target) for target in targets],
+                )
+            )
+
+        prefix = target_group.route_prefix.rstrip("/")
+        priority_route_configs = []
+        for index, route in enumerate(target_group.ingress_routes):
+            public_path = f"{prefix}{route.path}" or "/"
+            pattern = re.escape(public_path)
+            pattern = re.sub(r"\\\{[^}]+:path\\\}", ".+", pattern)
+            pattern = re.sub(r"\\\{[^}]+\\\}", "[^/]+", pattern)
+            priority_route_configs.append(
+                PriorityRouteConfig(
+                    name=f"priority_{backend_name}_{index}",
+                    methods=[method.upper() for method in (route.methods or [])],
+                    path_regex=f"^{pattern}/?$",
+                )
+            )
+
         return BackendConfig(
-            name=self._generate_backend_name(target_group),
+            name=backend_name,
             path_prefix=target_group.route_prefix,
             servers=servers,
             ingress_request_router_servers=ingress_request_router_servers,
             app_name=target_group.app_name,
             ingress_deployment_name=target_group.ingress_deployment_name,
+            ingress_routes=target_group.ingress_routes,
+            priority_route_configs=priority_route_configs,
+            direct_target_configs=direct_target_configs,
             fallback_server=fallback_server,
             protocol=target_group.protocol,
         )

@@ -193,6 +193,15 @@ frontend http_frontend
 {%- for backend in backends %}
     acl is_{{ backend.name or 'unknown' }} path_beg {{ '/' if not backend.path_prefix or backend.path_prefix == '/' else backend.path_prefix ~ '/' }}
     acl is_{{ backend.name or 'unknown' }} path {{ backend.path_prefix or '/' }}
+    {%- for route in backend.priority_route_configs %}
+    acl {{ route.name }} path_reg -i {{ route.path_regex }}
+    {%- if route.methods %}
+    acl {{ route.name }}_method method {{ route.methods | join(' ') }}
+    http-request set-var(txn.ingress_request_router_priority) bool(true) if is_{{ backend.name or 'unknown' }} {{ route.name }} {{ route.name }}_method
+    {%- else %}
+    http-request set-var(txn.ingress_request_router_priority) bool(true) if is_{{ backend.name or 'unknown' }} {{ route.name }}
+    {%- endif %}
+    {%- endfor %}
 {%- endfor %}
     {%- if config.metrics_enabled %}
     # Per-request HTTP metric vars (app / route / ingress deployment), set on the
@@ -222,13 +231,17 @@ frontend http_frontend
     # Lua then applies trusted metadata returned by /internal/route.
     http-request del-header {{ ingress_request_router_header_prefix }} -m beg if has_ingress_request_router_app
     {%- if ingress_request_router_forward_body %}
-    http-request wait-for-body time {{ ingress_request_router_timeout_s }}s if METH_POST has_ingress_request_router_app
+    http-request wait-for-body time {{ ingress_request_router_timeout_s }}s if METH_POST has_ingress_request_router_app !{ var(txn.ingress_request_router_priority) -m bool }
     {%- endif %}
-    http-request lua.route_via_ingress_request_router if METH_POST has_ingress_request_router_app
+    http-request lua.route_via_ingress_request_router if METH_POST has_ingress_request_router_app !{ var(txn.ingress_request_router_priority) -m bool }
+    http-request return status 400 content-type application/json string '{"error":{"message":"A model must be specified when multiple models are configured.","type":"invalid_request_error","code":400}}' if { var(txn.ingress_request_router_error_code) -m str "400" }
+    http-request return status 404 content-type application/json string '{"error":{"message":"The requested model was not found.","type":"invalid_request_error","code":404}}' if { var(txn.ingress_request_router_error_code) -m str "404" }
+    http-request return status 413 content-type application/json string '{"error":{"message":"The model could not be read from the buffered request body.","type":"invalid_request_error","code":413}}' if { var(txn.ingress_request_router_error_code) -m str "413" }
+    http-request return status 415 content-type application/json string '{"error":{"message":"Direct model routing requires an application/json request.","type":"invalid_request_error","code":415}}' if { var(txn.ingress_request_router_error_code) -m str "415" }
     # A pin-miss is recoverable only if its app has a fallback proxy. Mark it
     # per app so the 503 below fails loud for apps with none.
     {%- for backend in backends %}
-    {%- if backend.ingress_request_router_servers and backend.fallback_server %}
+    {%- if backend.ingress_request_router_servers and backend.fallback_server and not backend.direct_target_configs %}
     http-request set-var(txn.ingress_request_router_recoverable) str(1) if { var(txn.ingress_request_router_app) -m str "{{ backend.name or 'unknown' }}" } { var(txn.ingress_request_router_failed) -m str "unknown_replica_id" }
     {%- endif %}
     {%- endfor %}
@@ -239,10 +252,15 @@ frontend http_frontend
     # Static routing based on path prefixes in decreasing length then alphabetical order
 {%- for backend in backends %}
     {%- if has_ingress_request_router and backend.ingress_request_router_servers %}
+    {%- for direct in backend.direct_target_configs %}
+    use_backend {{ direct.name }} if is_{{ backend.name or 'unknown' }} { var(txn.via_ingress_request_router) -m found } { var(txn.ingress_request_router_deployment) -m str {{ direct.deployment_name | haproxy_fmt }} }
+    {%- endfor %}
+    {%- if not backend.direct_target_configs %}
     use_backend {{ backend.name or 'unknown' }}-via-ingress-request-router if is_{{ backend.name or 'unknown' }} { var(txn.via_ingress_request_router) -m found }
     {%- if backend.fallback_server %}
     # Pin-miss recovery: route into the router backend, which picks the fallback.
     use_backend {{ backend.name or 'unknown' }}-via-ingress-request-router if is_{{ backend.name or 'unknown' }} { var(txn.ingress_request_router_failed) -m str "unknown_replica_id" }
+    {%- endif %}
     {%- endif %}
     {%- endif %}
     use_backend {{ backend.name or 'unknown' }} if is_{{ backend.name or 'unknown' }}
@@ -296,6 +314,7 @@ backend {{ backend.name or 'unknown' }}
     server {{ backend.fallback_server.name }} {{ backend.fallback_server.host }}:{{ backend.fallback_server.port }} check backup
     {%- endif %}
 {%- if has_ingress_request_router and backend.ingress_request_router_servers %}
+{%- if not backend.direct_target_configs %}
 backend {{ backend.name or 'unknown' }}-via-ingress-request-router
     log global
     # Keep the pinned data-plane path on the same connection policy as the
@@ -335,8 +354,25 @@ backend {{ backend.name or 'unknown' }}-via-ingress-request-router
     {%- endfor %}
     {%- if backend.fallback_server %}
     server {{ backend.fallback_server.name }} {{ backend.fallback_server.host }}:{{ backend.fallback_server.port }} track {{ backend.name or 'unknown' }}/{{ backend.fallback_server.name }} backup
-    {%- endif %}
 {%- endif %}
+{%- endif %}
+{%- endif %}
+{%- for direct in backend.direct_target_configs %}
+backend {{ direct.name }}
+    log global
+    http-reuse always
+    {%- if backend.path_prefix and backend.path_prefix != '/' %}
+    http-request set-path / if { path {{ backend.path_prefix }} }
+    http-request set-path %[path,regsub(^{{ backend.path_prefix }}/,/)] if { path_beg {{ backend.path_prefix }}/ }
+    {%- endif %}
+    {%- if config.ingress_timeout_server_s is not none %}
+    timeout server {{ config.ingress_timeout_server_s }}s
+    {%- endif %}
+    {%- for server in direct.servers %}
+    use-server {{ server.name }} if { var(txn.ingress_request_router_target) -m str "{{ server.name }}" }
+    server {{ server.name }} {{ server.host }}:{{ server.port }} check
+    {%- endfor %}
+{%- endfor %}
 {%- endfor %}
 {%- if config.grpc_enabled %}
 frontend grpc_frontend

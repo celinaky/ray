@@ -4,7 +4,10 @@
 --
 -- Bodies exceeding tune.bufsize are truncated; we forward what we have with
 -- X-Body-Truncated since prefix-routing only needs the head of the body.
--- See RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY in constants.py.
+-- Body forwarding is always enabled for multi-target applications because
+-- model selection is data-plane critical. Since one process-wide script serves
+-- all applications, legacy router calls also receive bodies when they share an
+-- HAProxy process with a multi-target application.
 
 local ROUTER_REQUEST_TIMEOUT_S = ${TIMEOUT_S}
 local FORWARD_BODY = ${FORWARD_BODY}
@@ -29,7 +32,7 @@ local REPLICA_TARGETS = ${REPLICA_TARGETS}
 -- lua-load-per-thread, so rotation needs no cross-thread synchronization.
 local _rr_cursor = {}
 
-local function call_router(router, body, truncated_length, session_id, request_id)
+local function call_router(router, body, truncated_length, session_id, request_id, content_type)
     local sock = core.tcp()
     sock:settimeout(ROUTER_REQUEST_TIMEOUT_S)
 
@@ -57,7 +60,7 @@ local function call_router(router, body, truncated_length, session_id, request_i
     local req = "POST /internal/route HTTP/1.0\r\n"
         .. "Host: " .. router.host_header .. "\r\n"
         .. "Connection: close\r\n"
-        .. "Content-Type: application/json\r\n"
+        .. "Content-Type: " .. (content_type or "") .. "\r\n"
         .. "Content-Length: " .. #body .. "\r\n"
         .. truncation_header
         .. session_header
@@ -92,6 +95,14 @@ end
 -- relies on this; broaden the parser if the contract grows.
 local function extract_replica_id(json_body)
     return json_body:match('"replica_id"%s*:%s*"([^"]+)"')
+end
+
+local function extract_deployment(json_body)
+    return json_body:match('"deployment"%s*:%s*"([^"]+)"')
+end
+
+local function extract_error_code(json_body)
+    return tonumber(json_body:match('"error_code"%s*:%s*(%d+)'))
 end
 
 local function set_router_response_headers(txn, json_body)
@@ -156,6 +167,11 @@ local function _route_via_ingress_request_router(txn, app, pool, replica_map)
     if request_id_entry then
         request_id = request_id_entry[0]
     end
+    local content_type = nil
+    local content_type_entry = hdrs and hdrs["content-type"]
+    if content_type_entry then
+        content_type = content_type_entry[0]
+    end
 
     local session_id = nil
     if SESSION_HEADER ~= "" then
@@ -181,7 +197,8 @@ local function _route_via_ingress_request_router(txn, app, pool, replica_map)
     local response = nil
     for i = 0, n - 1 do
         local router = pool[(start + i) % n + 1]
-        response = call_router(router, body, truncated, session_id, request_id)
+        response = call_router(
+            router, body, truncated, session_id, request_id, content_type)
         if response then
             break
         end
@@ -196,13 +213,30 @@ local function _route_via_ingress_request_router(txn, app, pool, replica_map)
     end
 
     local response_body = http_response_body(response)
+    local error_code = extract_error_code(response_body)
+    if error_code then
+        txn:set_var("txn.ingress_request_router_error_code", tostring(error_code))
+        return
+    end
     local replica_id = extract_replica_id(response_body)
     if not replica_id then
         txn:set_var("txn.ingress_request_router_failed", "unparseable_replica_id")
         return
     end
 
-    local server_name = replica_map[replica_id]
+    local deployment = extract_deployment(response_body)
+    local deployment_map = replica_map
+    if deployment then
+        deployment_map = replica_map[deployment]
+        if not deployment_map then
+            txn:set_var("txn.ingress_request_router_failed", "unknown_deployment")
+            return
+        end
+        txn:set_var("txn.ingress_request_router_deployment", deployment)
+        txn:set_var("txn.serve_deployment", deployment)
+    end
+
+    local server_name = deployment_map[replica_id]
     if not server_name then
         -- Pin-miss: router named a replica not in HAProxy's server map, a
         -- transient gap between the router view and HAProxy's config snapshot.

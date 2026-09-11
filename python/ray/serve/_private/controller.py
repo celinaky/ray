@@ -104,6 +104,7 @@ from ray.serve.schema import (
     ApplicationDetails,
     DeploymentDetails,
     HTTPOptionsSchema,
+    HTTPRoute,
     LoggingConfig,
     ProxyDetails,
     ReplicaDetails,
@@ -1630,11 +1631,6 @@ class ServeController:
         replica_details = self._get_running_replica_details_for_ingress_deployment(
             app_name
         )
-        # Without ingress replicas, HAProxy has no data-plane targets to route to,
-        # so suppress router targets too — the app is effectively unreachable.
-        if not replica_details:
-            return []
-
         ingress_request_router_targets = []
         if ingress_request_router_deployment_name is not None:
             ingress_request_router_targets = self._get_targets_for_protocol(
@@ -1644,13 +1640,39 @@ class ServeController:
                 RequestProtocol.HTTP,
             )
 
+        ingress_routes = []
+        if ingress_deployment_name:
+            route_patterns = (
+                self.deployment_state_manager.get_deployment_route_patterns(
+                    DeploymentID(app_name=app_name, name=ingress_deployment_name)
+                )
+            )
+            ingress_routes = [
+                HTTPRoute(methods=pattern.methods, path=pattern.path)
+                for pattern in route_patterns or []
+            ]
+
+        direct_targets = {}
+        if ingress_request_router_deployment_name is not None:
+            for (
+                deployment_name
+            ) in self.application_state_manager.get_direct_http_deployment_names(
+                app_name
+            ):
+                direct_targets[deployment_name] = self._get_targets_for_protocol(
+                    self._get_running_replica_details_for_deployment(
+                        app_name, deployment_name
+                    ),
+                    RequestProtocol.HTTP,
+                )
+
         target_groups = []
 
         # Create targets for each protocol
         http_targets = self._get_targets_for_protocol(
             replica_details, RequestProtocol.HTTP
         )
-        if http_targets:
+        if http_targets or (ingress_request_router_targets and direct_targets):
             target_groups.append(
                 TargetGroup(
                     protocol=RequestProtocol.HTTP,
@@ -1659,6 +1681,8 @@ class ServeController:
                     app_name=app_name,
                     ingress_request_router_targets=ingress_request_router_targets,
                     ingress_deployment_name=ingress_deployment_name,
+                    ingress_routes=ingress_routes,
+                    direct_targets=direct_targets,
                 )
             )
 

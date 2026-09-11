@@ -1456,6 +1456,20 @@ class ApplicationStateManager:
 
         return self._application_states[name].ingress_request_router_deployment
 
+    def get_direct_http_deployment_names(self, name: str) -> List[str]:
+        """Return deployments in an application explicitly exposing replica HTTP."""
+        if name not in self._application_states:
+            return []
+        state = self._application_states[name]
+        infos = state._target_state.deployment_infos
+        if infos is None:
+            return []
+        return sorted(
+            deployment_name
+            for deployment_name, info in infos.items()
+            if info.deployment_config.direct_http
+        )
+
     def get_app_source(self, name: str) -> APIType:
         return self._application_states[name].api_type
 
