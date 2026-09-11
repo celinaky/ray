@@ -401,16 +401,18 @@ class TestBuildOpenaiApp:
         app = build_openai_app(LLMServingArgs(llm_configs=[llm_config]))
         ingress_request_router = app._ingress_request_router
 
-        assert app._bound_deployment.name == "LLMServer:test-model"
+        assert app._bound_deployment.name == "DirectStreamingIngress"
         assert issubclass(app._bound_deployment.func_or_class, ASGIAppReplicaWrapper)
         assert ingress_request_router is not None
         assert ingress_request_router._bound_deployment.name == "LLMRouter"
-        assert ingress_request_router._bound_deployment.init_kwargs["server"] is app
+        servers = ingress_request_router._bound_deployment.init_kwargs["servers"]
+        direct_deployment = servers[llm_config.model_id]
+        assert direct_deployment._bound_deployment._deployment_config.direct_http
 
         # `RequestRouterConfig._serialize_request_router_cls` normalizes the
         # class to its import path at config-build time.
         request_router_config = (
-            app._bound_deployment._deployment_config.request_router_config
+            direct_deployment._bound_deployment._deployment_config.request_router_config
         )
         assert request_router_config.request_router_class == (
             f"{RoundRobinRouter.__module__}.{RoundRobinRouter.__name__}"
@@ -433,14 +435,17 @@ class TestBuildOpenaiApp:
         )
 
         app = build_openai_app(LLMServingArgs(llm_configs=[llm_config]))
+        direct_deployment = app._bound_deployment.init_kwargs["llm_deployments"][
+            llm_config.model_id
+        ]
         request_router_config = (
-            app._bound_deployment._deployment_config.request_router_config
+            direct_deployment._bound_deployment._deployment_config.request_router_config
         )
         assert request_router_config.request_router_class == (
             f"{ConsistentHashRouter.__module__}.{ConsistentHashRouter.__name__}"
         )
 
-    def test_direct_streaming_rejects_multiple_llm_configs(
+    def test_direct_streaming_builds_multiple_llm_configs(
         self, llm_config, disable_placement_bundles, monkeypatch
     ):
         monkeypatch.setattr(
@@ -452,32 +457,21 @@ class TestBuildOpenaiApp:
             model_loading_config=ModelLoadingConfig(model_id="other-model")
         )
 
-        with pytest.raises(
-            ValueError,
-            match="currently supports exactly one LLM config",
-        ):
-            build_openai_app(LLMServingArgs(llm_configs=[llm_config, other_llm_config]))
+        app = build_openai_app(
+            LLMServingArgs(llm_configs=[llm_config, other_llm_config])
+        )
+        deployments = app._bound_deployment.init_kwargs["llm_deployments"]
+        assert set(deployments) == {llm_config.model_id, other_llm_config.model_id}
+        assert all(
+            deployment._bound_deployment._deployment_config.direct_http
+            for deployment in deployments.values()
+        )
 
-    @pytest.mark.parametrize(
-        ("builder_kwargs", "match"),
-        [
-            (
-                {"ingress_deployment_config": {"num_replicas": 2}},
-                "does not support ingress_deployment_config",
-            ),
-            (
-                {"ingress_cls_config": {"ingress_extra_kwargs": {"key": "value"}}},
-                "does not support ingress_cls_config",
-            ),
-        ],
-    )
-    def test_direct_streaming_rejects_ingress_config(
+    def test_direct_streaming_accepts_ingress_deployment_config(
         self,
         llm_config,
         disable_placement_bundles,
         monkeypatch,
-        builder_kwargs,
-        match,
     ):
         monkeypatch.setattr(
             "ray.llm._internal.serve.core.ingress.builder."
@@ -485,8 +479,13 @@ class TestBuildOpenaiApp:
             True,
         )
 
-        with pytest.raises(ValueError, match=match):
-            build_openai_app(LLMServingArgs(llm_configs=[llm_config], **builder_kwargs))
+        app = build_openai_app(
+            LLMServingArgs(
+                llm_configs=[llm_config],
+                ingress_deployment_config={"num_replicas": 2},
+            )
+        )
+        assert app._bound_deployment._deployment_config.num_replicas == 2
 
 
 class TestDirectStreamingDP:

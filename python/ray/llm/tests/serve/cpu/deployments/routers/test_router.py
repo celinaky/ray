@@ -138,6 +138,59 @@ def create_oai_client(llm_config: LLMConfig):
 
 class TestDirectStreamingLLMRouter:
     @pytest.mark.asyncio
+    async def test_multi_target_selects_model_deployment(self):
+        model_a = MagicMock(deployment_id=DeploymentID(name="model-a", app_name="app"))
+        model_b = MagicMock(deployment_id=DeploymentID(name="model-b", app_name="app"))
+        router = _new_direct_router(model_a)
+        router._multi_target = True
+        router._handles = {"a": model_a, "b": model_b}
+        router._pick_replica = AsyncMock(
+            return_value=("127.0.0.1", 9002, "model-b#replica", None)
+        )
+
+        result = await router.route(
+            _FakeRequest(
+                b'{"model":"b","messages":[{"role":"user","content":"hi"}]}',
+                headers={"content-type": "application/json"},
+            )
+        )
+
+        assert result["deployment"] == "model-b"
+        assert result["replica_id"] == "model-b#replica"
+        assert router._pick_replica.call_args.kwargs["handle"] is model_b
+
+    @pytest.mark.asyncio
+    async def test_multi_target_model_errors_and_single_model_default(self):
+        model_a = MagicMock(deployment_id=DeploymentID(name="model-a", app_name="app"))
+        router = _new_direct_router(model_a)
+        router._multi_target = True
+        router._handles = {"a": model_a}
+        router._pick_replica = AsyncMock(
+            return_value=("127.0.0.1", 9001, "model-a#replica", None)
+        )
+
+        result = await router.route(
+            _FakeRequest(
+                b'{"messages":[{"role":"user","content":"hi"}]}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        assert result["deployment"] == "model-a"
+
+        router._handles["b"] = MagicMock()
+        missing = await router.route(
+            _FakeRequest(b"{}", headers={"content-type": "application/json"})
+        )
+        unknown = await router.route(
+            _FakeRequest(
+                b'{"model":"unknown"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        assert missing == {"error_code": 400}
+        assert unknown == {"error_code": 404}
+
+    @pytest.mark.asyncio
     async def test_route_parses_body_into_routing_payload(self):
         """A parseable body becomes a routing payload passed positionally."""
         router = _new_direct_router()

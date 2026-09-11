@@ -132,6 +132,11 @@ DEFAULT_ENDPOINTS = {
     "detokenize": lambda app: app.post("/detokenize"),
 }
 
+DIRECT_STREAMING_INGRESS_ENDPOINTS = {
+    "models": DEFAULT_ENDPOINTS["models"],
+    "model_data": DEFAULT_ENDPOINTS["model_data"],
+}
+
 
 def init() -> FastAPI:
     _fastapi_router_app = FastAPI(lifespan=metrics_lifespan)
@@ -692,3 +697,16 @@ class OpenAiIngress(DeploymentProtocol):
         if _all_models_scale_to_zero(llm_configs):
             options.setdefault("autoscaling_config", {})["min_replicas"] = 0
         return options
+
+
+class DirectStreamingIngress(OpenAiIngress):
+    """Control-plane ingress for a direct-streaming LLM application.
+
+    Requests matching these explicitly registered routes are served here.
+    HAProxy sends all other application requests directly to a model deployment.
+    Subclasses may extend this map with additional control-plane operations.
+    """
+
+    @classmethod
+    def get_direct_streaming_endpoint_map(cls):
+        return DIRECT_STREAMING_INGRESS_ENDPOINTS

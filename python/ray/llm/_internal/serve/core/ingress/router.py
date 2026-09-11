@@ -2,11 +2,12 @@ import asyncio
 import json
 import uuid
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 
 from ray import serve
+from ray.llm._internal.common.utils.lora_utils import get_base_model_id
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     KV_TOKEN_KEY_HEADER,
@@ -120,10 +121,17 @@ class LLMRouter:
 
     async def __init__(
         self,
-        server: DeploymentHandle,
+        server: Optional[DeploymentHandle] = None,
+        servers: Optional[Dict[str, DeploymentHandle]] = None,
         llm_config: Optional["LLMConfig"] = None,
     ):
-        self._handle: DeploymentHandle = server
+        self._multi_target = servers is not None
+        if servers is None:
+            if server is None:
+                raise ValueError("Either server or servers must be provided.")
+            servers = {"": server}
+        self._handles = servers
+        self._handle: DeploymentHandle = next(iter(servers.values()))
         self._tokenizer = None
         self._token_sender = None
         # Holds the KVTokenTracker (KV-aware deployments only) so the
@@ -158,13 +166,51 @@ class LLMRouter:
             )
 
             self._token_sender = token_channel.TokenSender()
-        self._handle._init()
+        for handle in self._handles.values():
+            handle._init()
 
     @router_app.post("/internal/route")
     async def route(self, request: Request):
         body = await request.body()
         body_truncated = _BODY_TRUNCATED_HEADER in request.headers
-        routing_payload = _parse_routing_payload(body)
+        if getattr(self, "_multi_target", False):
+            if (
+                not request.headers.get("content-type", "")
+                .lower()
+                .startswith("application/json")
+            ):
+                return {"error_code": 415}
+            try:
+                if body_truncated:
+                    from pydantic_core import from_json
+
+                    data = from_json(body, allow_partial=True)
+                else:
+                    data = json.loads(body)
+            except (ValueError, TypeError):
+                return {"error_code": 413 if body_truncated else 400}
+            if not isinstance(data, dict):
+                return {"error_code": 400}
+
+            model_id = data.get("model")
+            if model_id is None or model_id == "":
+                if len(self._handles) != 1:
+                    return {"error_code": 413 if body_truncated else 400}
+                handle = next(iter(self._handles.values()))
+            elif not isinstance(model_id, str):
+                return {"error_code": 400}
+            else:
+                handle = self._handles.get(get_base_model_id(model_id))
+                if handle is None:
+                    return {"error_code": 404}
+            routing_payload = (
+                SimpleNamespace(**data)
+                if any(data.get(field) for field in _ROUTING_KEY_FIELDS)
+                else None
+            )
+        else:
+            handle = self._handle
+            routing_payload = _parse_routing_payload(body)
         if routing_payload is None and not self._warned_no_routing_key:
             self._warned_no_routing_key = True
             logger.warning(
@@ -198,9 +244,7 @@ class LLMRouter:
             (v for k, v in request.headers.items() if _matches_session_id_header(k)),
             None,
         )
-        handle = (
-            self._handle.options(session_id=session_id) if session_id else self._handle
-        )
+        handle = handle.options(session_id=session_id) if session_id else handle
         try:
             host, port, replica_id, token_endpoint = await self._pick_replica(
                 handle=handle,
@@ -213,6 +257,8 @@ class LLMRouter:
             raise HTTPException(status_code=503, detail=str(e))
 
         response = {"host": host, "port": port, "replica_id": replica_id}
+        if getattr(self, "_multi_target", False):
+            response["deployment"] = handle.deployment_id.name
         if request_token_ids:
             token_key = self._push_prompt_tokens(
                 token_endpoint=token_endpoint,
