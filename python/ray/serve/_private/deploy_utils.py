@@ -83,7 +83,7 @@ def deploy_args_to_deployment_info(
 
     deployment_config = DeploymentConfig.from_proto_bytes(deployment_config_proto_bytes)
 
-    if ingress and RAY_SERVE_ENABLE_DIRECT_INGRESS:
+    if (ingress or deployment_config.direct_http) and RAY_SERVE_ENABLE_DIRECT_INGRESS:
         # Model multiplexing relies on the multiplexed model ID being propagated through
         # the proxy, which direct ingress bypasses (the model ID is never populated).
         # Only the *statically* detectable case is caught here; dynamically-initialized
@@ -103,7 +103,7 @@ def deploy_args_to_deployment_info(
         )
         if deployment_config.graceful_shutdown_timeout_s < floor_s:
             logger.info(
-                f"Raising graceful_shutdown_timeout_s for ingress deployment "
+                f"Raising graceful_shutdown_timeout_s for direct HTTP deployment "
                 f"'{deployment_name}' from "
                 f"{deployment_config.graceful_shutdown_timeout_s}s to {floor_s}s so "
                 f"the force-kill deadline covers the direct-ingress drain period."

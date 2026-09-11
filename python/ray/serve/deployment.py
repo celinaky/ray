@@ -259,6 +259,7 @@ class Deployment:
         deployment_actors: Default[
             Optional[List[Union[Dict, DeploymentActorConfig]]]
         ] = DEFAULT.VALUE,
+        _direct_http: Default[bool] = DEFAULT.VALUE,
     ) -> "Deployment":
         """Return a copy of this deployment with updated options.
 
@@ -292,11 +293,13 @@ class Deployment:
         user_configured_option_names = [
             option
             for option, value in locals().items()
-            if option not in {"self", "func_or_class", "_internal"}
+            if option not in {"self", "func_or_class", "_internal", "_direct_http"}
             and value is not DEFAULT.VALUE
         ]
 
         new_deployment_config = deepcopy(self._deployment_config)
+        if _direct_http is not DEFAULT.VALUE:
+            new_deployment_config.direct_http = _direct_http
         if not _internal:
             new_deployment_config.user_configured_option_names.update(
                 user_configured_option_names

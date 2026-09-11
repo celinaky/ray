@@ -253,6 +253,14 @@ class DeploymentConfig(BaseModel):
         update_type=DeploymentOptionUpdateType.LightWeight,
     )
 
+    # Internal capability enabling HTTP on every replica, independent of the
+    # deployment's application ingress role. Changing it restarts replicas.
+    direct_http: bool = Field(
+        default=False,
+        strict=True,
+        update_type=DeploymentOptionUpdateType.HeavyWeight,
+    )
+
     # Contains the names of deployment options manually set by the user
     user_configured_option_names: Set[str] = set()
 

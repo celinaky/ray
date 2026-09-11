@@ -79,6 +79,8 @@ class DeploymentVersion:
             or self.max_replicas_per_node != new_version.max_replicas_per_node
             or self.gang_scheduling_config_hash
             != new_version.gang_scheduling_config_hash
+            or self.deployment_config.direct_http
+            != new_version.deployment_config.direct_http
         )
 
     def requires_actor_reconfigure(self, new_version):
@@ -152,6 +154,7 @@ class DeploymentVersion:
                 ]
             )
             + serialized_gang_scheduling_config
+            + _serialize(self.deployment_config.direct_http)
         )
 
     def to_proto(self) -> bytes:

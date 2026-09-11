@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, Union
 
 from ray.dag.py_obj_scanner import _PyObjScanner
 from ray.serve._private.constants import (
+    RAY_SERVE_ENABLE_DIRECT_INGRESS,
     RAY_SERVE_ENABLE_HA_PROXY,
     SERVE_LOGGER_NAME,
 )
@@ -80,11 +81,15 @@ class BuiltApplication:
     ingress_request_router_deployment: Optional[Deployment] = None
 
     def validate_single_fastapi_ingress(self) -> None:
-        """Validate that the application has at most one FastAPI ingress."""
+        """Validate that the application has at most one FastAPI ingress.
+        Allow additional ASGI deployments only with explicit direct HTTP opt-in.
+        """
         num_ingress_deployments = sum(
             inspect.isclass(deployment.func_or_class)
             and issubclass(deployment.func_or_class, ASGIAppReplicaWrapper)
             for deployment in self.deployments
+            if deployment.name == self.ingress_deployment_name
+            or not deployment._deployment_config.direct_http
         )
         if num_ingress_deployments > 1:
             raise RayServeException(
@@ -236,6 +241,20 @@ def _build_app_recursive(
     # a duplicate entry for it in the list of deployments.
     if app in handles:
         return []
+
+    if app._bound_deployment._deployment_config.direct_http:
+        if not RAY_SERVE_ENABLE_DIRECT_INGRESS:
+            raise RayServeException(
+                "`_direct_http=True` requires direct ingress. "
+                "Set `RAY_SERVE_ENABLE_DIRECT_INGRESS=1` or "
+                "`RAY_SERVE_ENABLE_HA_PROXY=1` in the controller's environment."
+            )
+        cls = app._bound_deployment.func_or_class
+        if not inspect.isclass(cls) or not issubclass(cls, ASGIAppReplicaWrapper):
+            raise RayServeException(
+                "`_direct_http=True` requires an ASGI deployment "
+                "decorated with `@serve.ingress`."
+            )
 
     deployments = []
     scanner: _PyObjScanner[Application, DeploymentHandle] = _PyObjScanner(

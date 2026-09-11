@@ -5665,11 +5665,12 @@ class DeploymentState:
         return self._deployed_info.ingress_request_router
 
     def owns_direct_ingress_ports(self) -> bool:
-        """Whether this deployment owns direct-ingress ports -- i.e. it is an
-        ingress deployment or an ingress request router. These are exactly the
-        deployments the direct-ingress port reconcile (and its membership-version
-        gate) manages."""
-        return self.is_ingress() or self.is_ingress_request_router()
+        """Whether replicas in this deployment may own direct-ingress ports."""
+        return (
+            self.is_ingress()
+            or self.is_ingress_request_router()
+            or self._deployed_info.deployment_config.direct_http
+        )
 
     def get_outbound_deployments(self) -> Optional[List[DeploymentID]]:
         """Get the outbound deployments.
@@ -6863,7 +6864,7 @@ class DeploymentStateManager:
     ) -> List[Tuple[Optional[str], str, Optional[int], Optional[int]]]:
         """Get replicas that own direct-ingress ports.
 
-        Includes both ingress deployments and ingress request router deployments.
+        Includes ingress deployments, request routers, and direct HTTP deployments.
         """
         ingress_replicas_list = [
             deployment_state._replicas.get()
