@@ -1098,6 +1098,7 @@ class Replica:
         ingress: bool,
         route_prefix: str,
         is_ingress_request_router: bool = False,
+        direct_http: bool = False,
     ):
         self._version = version
         self._replica_id = replica_id
@@ -1105,6 +1106,7 @@ class Replica:
         self._deployment_config = deployment_config
         self._ingress = ingress
         self._is_ingress_request_router = is_ingress_request_router
+        self._direct_http = direct_http
         self._route_prefix = route_prefix
         self._component_name = f"{self._deployment_id.name}"
         if self._deployment_id.app_name:
@@ -2257,7 +2259,11 @@ class Replica:
         if not RAY_SERVE_ENABLE_DIRECT_INGRESS:
             return
 
-        if not self._ingress and not self._is_ingress_request_router:
+        if (
+            not self._ingress
+            and not self._is_ingress_request_router
+            and not self._direct_http
+        ):
             return
 
         async def allocate_and_start_server(start_server_fn, protocol):
@@ -3345,6 +3351,7 @@ class ReplicaActor:
         ingress: bool,
         route_prefix: str,
         is_ingress_request_router: bool = False,
+        direct_http: bool = False,
     ):
         deployment_config = DeploymentConfig.from_proto_bytes(
             deployment_config_proto_bytes
@@ -3362,6 +3369,7 @@ class ReplicaActor:
             ingress=ingress,
             route_prefix=route_prefix,
             is_ingress_request_router=is_ingress_request_router,
+            direct_http=direct_http,
         )
 
     def push_proxy_handle(self, handle: ActorHandle):
