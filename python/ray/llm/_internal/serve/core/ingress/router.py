@@ -304,6 +304,16 @@ class LLMRouter:
         """Accept load and affinity updates from peer ingress replicas."""
         return await self._kv_token_tracker.on_replica_updates(source_writer_id, batch)
 
+    async def get_autoscaling_snapshot(self) -> Dict[str, int]:
+        """Return the KV tracker's current global work estimate.
+
+        A non-KV-aware router has no tracker and therefore cannot provide the
+        cache-aware signal. Engine relays ignore an empty response.
+        """
+        if self._kv_token_tracker is None:
+            return {}
+        return await self._kv_token_tracker.get_autoscaling_snapshot()
+
     def _push_prompt_tokens(
         self,
         *,
