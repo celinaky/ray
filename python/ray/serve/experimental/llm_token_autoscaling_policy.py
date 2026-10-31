@@ -140,19 +140,11 @@ class LLMTokenAutoscalingPolicy:
             * prefill_arrival_p95
             / self._target_prefill_tokens_per_replica
         )
-        target = ctx.target_num_replicas
         if sample_count < self._min_arrival_samples:
             # Too few arrivals to trust a tail statistic: hold the current count.
-            required_replicas = target
+            required_replicas = ctx.target_num_replicas
         else:
             required_replicas = math.ceil(prefill_required_replicas)
-            # One replica per decision in either direction, and never a second
-            # one up while the previous one is still starting: the p95 cannot
-            # reflect a replica that has not served anything yet.
-            required_replicas = min(
-                required_replicas, target + 1, ctx.current_num_replicas + 1
-            )
-            required_replicas = max(required_replicas, target - 1)
         if ctx.total_queued_requests > 0:
             required_replicas = max(1, required_replicas)
 
