@@ -6,7 +6,6 @@ from ray.serve._private.common import TimeStampedValue
 from ray.serve._private.constants import SERVE_AUTOSCALING_POLICY_METRICS_KEY
 from ray.serve.experimental.llm_token_autoscaling_policy import (
     ACTIVE_DECODE_REQUESTS,
-    DECODE_REQUIRED_REPLICAS,
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
     PREFILL_ARRIVAL_AHEAD_TOKENS,
     PREFILL_ARRIVAL_P95_TOKENS,
@@ -58,7 +57,7 @@ def _context(
     )
 
 
-def test_scales_from_max_global_snapshot_across_reporters():
+def test_decision_uses_prefill_p95_and_still_reports_snapshot_metrics():
     policy = LLMTokenAutoscalingPolicy(
         target_prefill_tokens_per_replica=100,
         target_decode_requests_per_replica=4,
@@ -66,14 +65,15 @@ def test_scales_from_max_global_snapshot_across_reporters():
     ctx = _context(
         prefill_by_replica={"a": (99, 250), "b": (99, 200)},
         decode_by_replica={"a": (99, 3), "b": (99, 9)},
+        prefill_arrivals_by_router={"router": (99, 25)},
     )
 
     replicas, state = policy(ctx)
 
-    assert replicas == 3
+    assert replicas == 1
     assert state[OUTSTANDING_EFFECTIVE_PREFILL_TOKENS] == 250
     assert state[ACTIVE_DECODE_REQUESTS] == 9
-    assert state["required_replicas"] == 3
+    assert state["required_replicas"] == 1
 
 
 def test_scales_to_zero_when_idle():
@@ -244,22 +244,21 @@ def test_prefill_p95_ignores_arrivals_before_window():
     assert replicas == 1
 
 
-def test_decode_mean_remains_time_weighted():
+def test_active_decode_does_not_affect_replica_decision():
     policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
 
     replicas, state = policy(
         _context(
-            prefill_by_replica={"a": [(70, 0), (90, 0), (95, 0)]},
-            decode_by_replica={"a": [(70, 12), (90, 28), (95, 12)]},
+            prefill_by_replica={"a": (99, 0)},
+            decode_by_replica={"a": (99, 400)},
+            prefill_arrivals_by_router={"router": (99, 0)},
             current_num_replicas=1,
             target_num_replicas=1,
         )
     )
 
-    assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY][
-        DECODE_REQUIRED_REPLICAS
-    ] == pytest.approx(11 / 3)
-    assert replicas == 4
+    assert state[ACTIVE_DECODE_REQUESTS] == 400
+    assert replicas == 0
 
 
 def test_holds_target_when_no_complete_snapshot_is_in_upscale_window():
@@ -368,7 +367,7 @@ def test_scales_down_to_arrival_p95():
     assert state["required_replicas"] == 2
 
 
-def test_publishes_prefill_p95_and_decode_mean():
+def test_publishes_prefill_p95_metrics():
     policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
 
     replicas, state = policy(
@@ -381,12 +380,11 @@ def test_publishes_prefill_p95_and_decode_mean():
         )
     )
 
-    # Prefill asks for 1.5 replicas and decode's lookback mean asks for 2.
+    # Prefill asks for 1.5 replicas. Decode does not affect the decision.
     assert replicas == 2
     assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY] == {
         PREFILL_REQUIRED_REPLICAS: pytest.approx(1.5),
         PREFILL_ARRIVAL_P95_TOKENS: 150,
-        DECODE_REQUIRED_REPLICAS: pytest.approx(2.0),
         REQUIRED_REPLICAS: 2,
     }
 

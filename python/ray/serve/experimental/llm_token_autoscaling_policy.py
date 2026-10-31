@@ -83,8 +83,8 @@ class LLMTokenAutoscalingPolicy:
     Prefill capacity follows the request-weighted p95 of uncached prefill tokens
     already ahead on the selected worker when each request arrived. Each router
     owns a disjoint subset of those arrival observations, so their samples are
-    concatenated rather than maximized. Decode capacity continues to follow the
-    time-weighted mean of the globally replicated active-request gauge.
+    concatenated rather than maximized. Decode metrics remain available for
+    observability, but they do not affect the replica decision.
 
     The prefill p95 is a per-replica load observation. Its ratio to
     ``target_prefill_tokens_per_replica`` is therefore a scaling factor applied
@@ -210,15 +210,7 @@ class LLMTokenAutoscalingPolicy:
             * prefill_arrival_p95
             / self._target_prefill_tokens_per_replica
         )
-        decode_required_replicas = self._aggregate_capacity(
-            snapshots_by_source,
-            now,
-            "mean",
-            lambda _, decode: max(0, decode) / self._target_decode_requests_per_replica,
-        )
-        required_replicas = math.ceil(
-            max(prefill_required_replicas, decode_required_replicas)
-        )
+        required_replicas = math.ceil(prefill_required_replicas)
         if ctx.total_queued_requests > 0:
             required_replicas = max(1, required_replicas)
 
@@ -229,7 +221,7 @@ class LLMTokenAutoscalingPolicy:
         active_decode_requests = max(
             max(0, decode) for _, _, decode in latest_snapshots
         )
-        if outstanding_prefill_tokens > 0 or active_decode_requests > 0:
+        if outstanding_prefill_tokens > 0:
             required_replicas = max(1, required_replicas)
         state: Dict[str, Any] = {
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
@@ -240,7 +232,6 @@ class LLMTokenAutoscalingPolicy:
             SERVE_AUTOSCALING_POLICY_METRICS_KEY: {
                 PREFILL_REQUIRED_REPLICAS: prefill_required_replicas,
                 PREFILL_ARRIVAL_P95_TOKENS: prefill_arrival_p95,
-                DECODE_REQUIRED_REPLICAS: decode_required_replicas,
                 REQUIRED_REPLICAS: required_replicas,
             },
         }
