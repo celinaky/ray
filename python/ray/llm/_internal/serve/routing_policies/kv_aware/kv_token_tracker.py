@@ -26,9 +26,12 @@ from ray.serve._private.constants import (
 )
 from ray.serve._private.long_poll import LongPollClient, LongPollNamespace
 from ray.serve.experimental.llm_token_autoscaling_policy import (
-    ACTIVE_DECODE_REQUESTS,
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
 )
+
+# Reported in the autoscaling snapshot for observability; the token policy
+# scales on outstanding prefill tokens only and ignores it.
+ACTIVE_DECODE_REQUESTS = "active_decode_requests"
 
 if TYPE_CHECKING:
     from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
