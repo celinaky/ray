@@ -11,6 +11,7 @@ PREFILL_ARRIVAL_AHEAD_TOKENS = "prefill_arrival_ahead_tokens"
 # Policy metrics exported by the controller as serve_autoscaling_policy_metric.
 PREFILL_REQUIRED_REPLICAS = "prefill_required_replicas"
 PREFILL_ARRIVAL_P95_TOKENS = "prefill_arrival_p95_tokens"
+PREFILL_ARRIVAL_SAMPLES = "prefill_arrival_samples"
 REQUIRED_REPLICAS = "required_replicas"
 
 _UpscaleAggregation = Literal["max", "mean"]
@@ -67,11 +68,14 @@ class LLMTokenAutoscalingPolicy:
         self,
         target_prefill_tokens_per_replica: int,
         upscale_lookback_s: float = 30,
+        min_arrival_samples: int = 50,
         upscale_aggregation: _UpscaleAggregation = "max",
         scale_down_sensitivity: float = 0.8,
     ):
         if target_prefill_tokens_per_replica <= 0:
             raise ValueError("target_prefill_tokens_per_replica must be positive")
+        if min_arrival_samples < 1:
+            raise ValueError("min_arrival_samples must be at least 1")
         if not math.isfinite(upscale_lookback_s) or upscale_lookback_s <= 0:
             raise ValueError("upscale_lookback_s must be positive and finite")
         if upscale_aggregation not in ("max", "mean"):
@@ -85,11 +89,14 @@ class LLMTokenAutoscalingPolicy:
 
         self._target_prefill_tokens_per_replica = target_prefill_tokens_per_replica
         self._upscale_lookback_s = upscale_lookback_s
+        self._min_arrival_samples = min_arrival_samples
         self._upscale_aggregation = upscale_aggregation
         self._scale_down_sensitivity = scale_down_sensitivity
 
-    def _prefill_arrival_p95(self, ctx: AutoscalingContext, now: float) -> float:
-        """Return p95 across all fresh router-local request-arrival samples."""
+    def _prefill_arrival_p95(
+        self, ctx: AutoscalingContext, now: float
+    ) -> Tuple[float, int]:
+        """Return the p95 and count of fresh router-local request-arrival samples."""
         window_start = now - self._upscale_lookback_s
         raw_metrics = ctx.raw_router_metrics or {}
         samples = sorted(
@@ -99,11 +106,11 @@ class LLMTokenAutoscalingPolicy:
             if point.timestamp >= window_start
         )
         if not samples:
-            return 0.0
+            return 0.0, 0
 
         # Nearest-rank p95: the smallest observed value with at least 95% of
         # request arrivals at or below it. This directly matches the SLO.
-        return samples[math.ceil(0.95 * len(samples)) - 1]
+        return samples[math.ceil(0.95 * len(samples)) - 1], len(samples)
 
     def __call__(self, ctx: AutoscalingContext) -> Tuple[int, Dict[str, Any]]:
         if self._upscale_lookback_s > ctx.config.look_back_period_s:
@@ -127,13 +134,25 @@ class LLMTokenAutoscalingPolicy:
             # No observation in the lookback window is also fail-closed.
             return ctx.target_num_replicas, {}
 
-        prefill_arrival_p95 = self._prefill_arrival_p95(ctx, now)
+        prefill_arrival_p95, sample_count = self._prefill_arrival_p95(ctx, now)
         prefill_required_replicas = (
             ctx.current_num_replicas
             * prefill_arrival_p95
             / self._target_prefill_tokens_per_replica
         )
-        required_replicas = math.ceil(prefill_required_replicas)
+        target = ctx.target_num_replicas
+        if sample_count < self._min_arrival_samples:
+            # Too few arrivals to trust a tail statistic: hold the current count.
+            required_replicas = target
+        else:
+            required_replicas = math.ceil(prefill_required_replicas)
+            # One replica per decision in either direction, and never a second
+            # one up while the previous one is still starting: the p95 cannot
+            # reflect a replica that has not served anything yet.
+            required_replicas = min(
+                required_replicas, target + 1, ctx.current_num_replicas + 1
+            )
+            required_replicas = max(required_replicas, target - 1)
         if ctx.total_queued_requests > 0:
             required_replicas = max(1, required_replicas)
 
@@ -146,12 +165,15 @@ class LLMTokenAutoscalingPolicy:
         state: Dict[str, Any] = {
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
             PREFILL_ARRIVAL_P95_TOKENS: prefill_arrival_p95,
+            PREFILL_ARRIVAL_SAMPLES: sample_count,
             REQUIRED_REPLICAS: required_replicas,
             "lookback_s": self._upscale_lookback_s,
+            "min_arrival_samples": self._min_arrival_samples,
             SERVE_AUTOSCALING_POLICY_METRICS_KEY: {
                 OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
                 PREFILL_REQUIRED_REPLICAS: prefill_required_replicas,
                 PREFILL_ARRIVAL_P95_TOKENS: prefill_arrival_p95,
+                PREFILL_ARRIVAL_SAMPLES: sample_count,
                 REQUIRED_REPLICAS: required_replicas,
             },
         }
