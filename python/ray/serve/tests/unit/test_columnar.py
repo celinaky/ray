@@ -124,6 +124,11 @@ def _rich_handle_report():
                 TimeStampedValue(10.0, 14.0),
                 TimeStampedValue(11.0, 17.0),
             ],
+            "prefill_arrival_ahead_tokens": [
+                TimeStampedValue(10.25, 0.0),
+                TimeStampedValue(10.75, 2400.0),
+                TimeStampedValue(11.25, 800.0),
+            ],
         },
     )
 
@@ -279,6 +284,7 @@ def test_context_exposes_raw_router_metrics_by_handle(columnar):
     for metric_name in (
         "outstanding_effective_prefill_tokens",
         "active_decode_requests",
+        "prefill_arrival_ahead_tokens",
     ):
         assert [
             (point.timestamp, point.value)

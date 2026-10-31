@@ -27,6 +27,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.vllm.token_tracking impor
     enable_token_tracking,
 )
 from ray.llm.tests.serve.mocks.mock_vllm_engine import MockAsyncLLM
+from ray.serve.experimental.llm_token_autoscaling_policy import (
+    PREFILL_ARRIVAL_AHEAD_TOKENS,
+)
 from ray.serve.llm.request_router import KVAwareRouter
 
 # The @ray.remote actors below are pickled by reference, so a worker must import
@@ -132,6 +135,7 @@ class RecordingKVTokenTracker(KVTokenTracker):
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._outstanding_effective_prefill_tokens = 0
+        self._outstanding_prefill_tokens_by_worker = {}
         self._active_decode_requests = 0
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
@@ -185,6 +189,7 @@ class LocalKVTokenTracker(KVTokenTracker):
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._outstanding_effective_prefill_tokens = 0
+        self._outstanding_prefill_tokens_by_worker = {}
         self._active_decode_requests = 0
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
@@ -751,6 +756,29 @@ async def test_active_load_tracking():
     await actor.on_decode_progress("missing", 3)
     await actor.on_request_completed("missing")
     assert await actor.get_request_lifecycle("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_records_selected_worker_prefill_load_before_arrival():
+    actor = LocalKVTokenTracker(block_size=16)
+    observations = []
+    actor.set_autoscaling_event_sink(
+        lambda name, value: observations.append((name, value))
+    )
+
+    await reserve(actor, "a", 1, list(range(8)))
+    await reserve(actor, "b", 1, list(range(8, 20)))
+    await reserve(actor, "c", 2, list(range(20, 24)))
+
+    assert observations == [
+        (PREFILL_ARRIVAL_AHEAD_TOKENS, 0),
+        (PREFILL_ARRIVAL_AHEAD_TOKENS, 8),
+        (PREFILL_ARRIVAL_AHEAD_TOKENS, 0),
+    ]
+
+    await actor.on_prefill_complete("a")
+    await reserve(actor, "d", 1, list(range(24, 28)))
+    assert observations[-1] == (PREFILL_ARRIVAL_AHEAD_TOKENS, 12)
 
 
 @pytest.mark.asyncio

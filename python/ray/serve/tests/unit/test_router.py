@@ -2460,6 +2460,10 @@ class TestRouterMetricsManager:
                 "active_decode_requests": 7.0,
             }
             metrics_manager.set_custom_router_metrics(custom_router_metrics)
+            event_metric = "prefill_arrival_ahead_tokens"
+            metrics_manager.record_custom_router_metric(event_metric, 11)
+            timer.advance(1)
+            metrics_manager.record_custom_router_metric(event_metric, 22)
             metrics_manager._add_autoscaling_metrics_point()
 
             # Which wire format we chose to send. The kill switch is the only thing
@@ -2484,10 +2488,18 @@ class TestRouterMetricsManager:
                 assert set(report["replica_keys"]) == {
                     r.to_full_id_str() for r in running_requests
                 }
-                assert set(report["router_metric_names"]) == set(custom_router_metrics)
-                assert report["router_val"].tolist() == list(
-                    custom_router_metrics.values()
-                )
+                assert set(report["router_metric_names"]) == {
+                    *custom_router_metrics,
+                    event_metric,
+                }
+                router_values = {}
+                for metric_idx, offset, count in report["router_entries"].tolist():
+                    router_values[report["router_metric_names"][metric_idx]] = report[
+                        "router_val"
+                    ][offset : offset + count].tolist()
+                assert router_values[event_metric] == [11, 22]
+                for name, value in custom_router_metrics.items():
+                    assert router_values[name][-1] == value
             else:
                 report = decompress_metric_report(payload)
                 assert report.deployment_id == deployment_id
@@ -2497,6 +2509,9 @@ class TestRouterMetricsManager:
                     for name, series in report.router_metrics.items()
                     if name in custom_router_metrics
                 } == custom_router_metrics
+                assert [
+                    point.value for point in report.router_metrics[event_metric]
+                ] == [11, 22]
 
     @pytest.mark.skipif(
         not RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE,

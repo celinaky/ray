@@ -8,6 +8,8 @@ from ray.serve.experimental.llm_token_autoscaling_policy import (
     ACTIVE_DECODE_REQUESTS,
     DECODE_REQUIRED_REPLICAS,
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
+    PREFILL_ARRIVAL_AHEAD_TOKENS,
+    PREFILL_ARRIVAL_P95_TOKENS,
     PREFILL_REQUIRED_REPLICAS,
     REQUIRED_REPLICAS,
     LLMTokenAutoscalingPolicy,
@@ -18,7 +20,9 @@ def _context(
     *,
     prefill_by_replica=None,
     decode_by_replica=None,
+    prefill_arrivals_by_router=None,
     now=100.0,
+    current_num_replicas=None,
     target_num_replicas=2,
     look_back_period_s=30,
 ):
@@ -39,10 +43,16 @@ def _context(
         raw_router_metrics={
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: to_series(prefill_by_replica or {}),
             ACTIVE_DECODE_REQUESTS: to_series(decode_by_replica or {}),
+            PREFILL_ARRIVAL_AHEAD_TOKENS: to_series(prefill_arrivals_by_router or {}),
         },
         current_time=now,
         config=SimpleNamespace(look_back_period_s=look_back_period_s),
         running_replicas=list(replica_ids),
+        current_num_replicas=(
+            target_num_replicas
+            if current_num_replicas is None
+            else current_num_replicas
+        ),
         target_num_replicas=target_num_replicas,
         total_queued_requests=0,
     )
@@ -171,79 +181,85 @@ def test_max_aggregation_retains_then_expires_peak():
     assert state["required_replicas"] == 1
 
 
-def test_mean_aggregation_is_time_weighted():
-    policy = LLMTokenAutoscalingPolicy(
-        100,
-        4,
-        upscale_lookback_s=30,
-        upscale_aggregation="mean",
-    )
+def test_prefill_p95_concatenates_arrivals_across_routers():
+    policy = LLMTokenAutoscalingPolicy(100, 4)
+    arrivals = {
+        "router-a": [(80 + i, 10) for i in range(10)],
+        "router-b": [
+            *[(90 + i, 10) for i in range(8)],
+            (98, 150),
+            (99, 1000),
+        ],
+    }
 
     replicas, state = policy(
         _context(
-            prefill_by_replica={"a": [(70, 300), (90, 700), (95, 300)]},
-            decode_by_replica={"a": [(70, 0), (90, 0), (95, 0)]},
-            target_num_replicas=1,
+            prefill_by_replica={"a": (99, 1)},
+            decode_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router=arrivals,
+            current_num_replicas=2,
+            target_num_replicas=2,
         )
     )
 
-    assert replicas == 4
-    assert state["required_replicas"] == 4
+    # Nearest-rank p95 of 20 samples is the 19th value (150), not the max.
+    assert state[PREFILL_ARRIVAL_P95_TOKENS] == 150
+    assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY][
+        PREFILL_REQUIRED_REPLICAS
+    ] == pytest.approx(3)
+    assert replicas == 3
 
 
-def test_mean_aggregation_rounds_after_aggregating():
-    policy = LLMTokenAutoscalingPolicy(
-        100,
-        4,
-        upscale_lookback_s=30,
-        upscale_aggregation="mean",
-    )
-
-    replicas, state = policy(
-        _context(
-            prefill_by_replica={"a": [(70, 1), (85, 101)]},
-            decode_by_replica={"a": [(70, 0), (85, 0)]},
-            target_num_replicas=1,
-        )
-    )
-
-    assert replicas == 1
-    assert state["required_replicas"] == 1
-
-
-def test_mean_aggregation_carries_gauge_across_window_boundary():
-    policy = LLMTokenAutoscalingPolicy(
-        100,
-        4,
-        upscale_lookback_s=30,
-        upscale_aggregation="mean",
-    )
-
-    replicas, state = policy(
-        _context(
-            prefill_by_replica={"a": [(69, 300), (80, 0)]},
-            decode_by_replica={"a": [(69, 0), (80, 0)]},
-            target_num_replicas=1,
-            look_back_period_s=60,
-        )
-    )
-
-    assert replicas == 1
-    assert state["required_replicas"] == 1
-
-
-def test_aggregation_takes_max_across_reporters_without_summing():
+def test_prefill_p95_uses_current_replica_count_as_scaling_basis():
     policy = LLMTokenAutoscalingPolicy(100, 4)
 
     replicas, _ = policy(
         _context(
-            prefill_by_replica={"a": (99, 200), "b": (99, 300)},
-            decode_by_replica={"a": (99, 0), "b": (99, 0)},
+            prefill_by_replica={"a": (99, 1)},
+            decode_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router={"router": (99, 80)},
+            current_num_replicas=3,
+            target_num_replicas=3,
+        )
+    )
+
+    assert replicas == 3  # ceil(3 * 80 / 100)
+
+
+def test_prefill_p95_ignores_arrivals_before_window():
+    policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
+
+    replicas, state = policy(
+        _context(
+            prefill_by_replica={"a": (99, 1)},
+            decode_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router={"router": [(69, 1000), (99, 20)]},
+            current_num_replicas=3,
+            target_num_replicas=3,
+            look_back_period_s=60,
+        )
+    )
+
+    assert state[PREFILL_ARRIVAL_P95_TOKENS] == 20
+    assert replicas == 1
+
+
+def test_decode_mean_remains_time_weighted():
+    policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
+
+    replicas, state = policy(
+        _context(
+            prefill_by_replica={"a": [(70, 0), (90, 0), (95, 0)]},
+            decode_by_replica={"a": [(70, 12), (90, 28), (95, 12)]},
+            current_num_replicas=1,
             target_num_replicas=1,
         )
     )
 
-    assert replicas == 3
+    assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY][
+        DECODE_REQUIRED_REPLICAS
+    ] == pytest.approx(11 / 3)
+    assert replicas == 4
 
 
 def test_holds_target_when_no_complete_snapshot_is_in_upscale_window():
@@ -334,38 +350,42 @@ def test_scales_down_only_one_replica_when_idle():
     assert replicas == 6
 
 
-def test_scales_down_to_lookback_mean():
+def test_scales_down_to_arrival_p95():
     policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
 
     replicas, state = policy(
         _context(
-            prefill_by_replica={"a": [(70, 300), (85, 100)]},
-            decode_by_replica={"a": [(70, 0), (85, 0)]},
+            prefill_by_replica={"a": (99, 1)},
+            decode_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router={"router": (99, 25)},
+            current_num_replicas=7,
             target_num_replicas=7,
         )
     )
 
-    # Mean capacity is (3 * 15 + 1 * 15) / 30 = 2; no one-replica step limit.
+    # ceil(7 current replicas * 25 arrival p95 / 100 target) = 2.
     assert replicas == 2
     assert state["required_replicas"] == 2
 
 
-def test_publishes_per_dimension_lookback_means():
+def test_publishes_prefill_p95_and_decode_mean():
     policy = LLMTokenAutoscalingPolicy(100, 4, upscale_lookback_s=30)
 
-    # Prefill is busy for the first half of the window, decode for the second.
     replicas, state = policy(
         _context(
-            prefill_by_replica={"a": [(70, 400), (85, 0)]},
+            prefill_by_replica={"a": [(70, 0), (85, 0)]},
             decode_by_replica={"a": [(70, 0), (85, 16)]},
+            prefill_arrivals_by_router={"router": (99, 150)},
+            current_num_replicas=1,
             target_num_replicas=1,
         )
     )
 
-    # Max of the per-dimension means, not the mean of the per-sample max (4).
+    # Prefill asks for 1.5 replicas and decode's lookback mean asks for 2.
     assert replicas == 2
     assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY] == {
-        PREFILL_REQUIRED_REPLICAS: pytest.approx(2.0),
+        PREFILL_REQUIRED_REPLICAS: pytest.approx(1.5),
+        PREFILL_ARRIVAL_P95_TOKENS: 150,
         DECODE_REQUIRED_REPLICAS: pytest.approx(2.0),
         REQUIRED_REPLICAS: 2,
     }

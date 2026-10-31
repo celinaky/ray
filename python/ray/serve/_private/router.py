@@ -22,6 +22,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -196,6 +197,7 @@ class RouterMetricsManager:
         self.metrics_store = InMemoryMetricsStore()
         self._router_metrics_store = InMemoryMetricsStore()
         self._latest_custom_router_metrics: Dict[str, float] = {}
+        self._custom_router_event_metrics: Set[str] = set()
         # The config for the deployment this router sends requests to will be broadcast
         # by the controller. That means it is not available until we get the first
         # update. This includes an optional autoscaling config.
@@ -406,9 +408,31 @@ class RouterMetricsManager:
                 raise TypeError(
                     f"Router autoscaling metric '{name}' must be a finite number."
                 )
+            if name in self._custom_router_event_metrics:
+                raise ValueError(
+                    f"Router autoscaling metric '{name}' is already an event metric."
+                )
             validated[name] = float(value)
 
         self._latest_custom_router_metrics = validated
+
+    def record_custom_router_metric(self, name: str, value: Union[int, float]) -> None:
+        """Record one event-valued router metric at its occurrence time."""
+        if not isinstance(name, str):
+            raise TypeError("Router autoscaling metric names must be strings.")
+        if name in (ROUTER_QUEUED_REQUESTS_KEY, RUNNING_REQUESTS_KEY):
+            raise ValueError(f"Router autoscaling metric name '{name}' is reserved.")
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise TypeError(
+                f"Router autoscaling metric '{name}' must be a finite number."
+            )
+        if name in self._latest_custom_router_metrics:
+            raise ValueError(
+                f"Router autoscaling metric '{name}' is already a snapshot metric."
+            )
+
+        self._custom_router_event_metrics.add(name)
+        self._router_metrics_store.add_metrics_point({name: float(value)}, time.time())
 
     def inc_num_queued_requests(self):
         self.num_queued_requests += 1
@@ -567,6 +591,10 @@ class RouterMetricsManager:
                     )
                     for metric_name, value in self._latest_custom_router_metrics.items()
                 },
+                **{
+                    metric_name: self._router_metrics_store.data.get(metric_name, [])
+                    for metric_name in self._custom_router_event_metrics
+                },
             },
         )
 
@@ -603,6 +631,13 @@ class Router(ABC):
         self, metrics_dict: Dict[str, Union[int, float]]
     ) -> None:
         """Replace router-owned autoscaling metrics for this handle."""
+        pass
+
+    @abstractmethod
+    def record_router_autoscaling_metric(
+        self, name: str, value: Union[int, float]
+    ) -> None:
+        """Record one event-valued router-owned autoscaling metric."""
         pass
 
     @abstractmethod
@@ -871,6 +906,11 @@ class AsyncioRouter:
         self, metrics_dict: Dict[str, Union[int, float]]
     ) -> None:
         self._metrics_manager.set_custom_router_metrics(metrics_dict)
+
+    def record_router_autoscaling_metric(
+        self, name: str, value: Union[int, float]
+    ) -> None:
+        self._metrics_manager.record_custom_router_metric(name, value)
 
     def update_deployment_targets(self, deployment_target_info: DeploymentTargetInfo):
         self._deployment_available = deployment_target_info.is_available
@@ -1811,6 +1851,15 @@ class SingletonThreadRouter(Router):
             dict(metrics_dict),
         )
 
+    def record_router_autoscaling_metric(
+        self, name: str, value: Union[int, float]
+    ) -> None:
+        cast(asyncio.AbstractEventLoop, self._asyncio_loop).call_soon_threadsafe(
+            self._asyncio_router.record_router_autoscaling_metric,
+            name,
+            value,
+        )
+
     def assign_request(
         self,
         request_meta: RequestMetadata,
@@ -2139,6 +2188,11 @@ class CurrentLoopRouter(Router):
         self, metrics_dict: Dict[str, Union[int, float]]
     ) -> None:
         self._asyncio_router.set_router_autoscaling_metrics(metrics_dict)
+
+    def record_router_autoscaling_metric(
+        self, name: str, value: Union[int, float]
+    ) -> None:
+        self._asyncio_router.record_router_autoscaling_metric(name, value)
 
     def assign_request(  # type: ignore[override]  # pyrefly: ignore[bad-override]
         self,

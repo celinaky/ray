@@ -28,6 +28,7 @@ from ray.serve._private.long_poll import LongPollClient, LongPollNamespace
 from ray.serve.experimental.llm_token_autoscaling_policy import (
     ACTIVE_DECODE_REQUESTS,
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
+    PREFILL_ARRIVAL_AHEAD_TOKENS,
 )
 
 if TYPE_CHECKING:
@@ -217,10 +218,12 @@ class KVTokenTracker:
         # Keep these incrementally rather than scanning every live request on
         # each metrics collection interval.
         self._outstanding_effective_prefill_tokens = 0
+        self._outstanding_prefill_tokens_by_worker: Dict[int, int] = {}
         self._active_decode_requests = 0
         self._autoscaling_metrics_sink: Optional[
             Callable[[Dict[str, int]], None]
         ] = None
+        self._autoscaling_event_sink: Optional[Callable[[str, int], None]] = None
         self._autoscaling_publish_defer_depth = 0
         self._autoscaling_publish_dirty = False
         # Reverse index of in-flight request ids per worker, kept in lockstep with
@@ -341,6 +344,10 @@ class KVTokenTracker:
         self._autoscaling_metrics_sink = sink
         self._publish_autoscaling_snapshot()
 
+    def set_autoscaling_event_sink(self, sink: Callable[[str, int], None]) -> None:
+        """Set the local sink for request-arrival autoscaling observations."""
+        self._autoscaling_event_sink = sink
+
     def _get_autoscaling_snapshot(self) -> Dict[str, int]:
         return {
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: (
@@ -348,6 +355,11 @@ class KVTokenTracker:
             ),
             ACTIVE_DECODE_REQUESTS: self._active_decode_requests,
         }
+
+    def _record_autoscaling_event(self, name: str, value: int) -> None:
+        sink = getattr(self, "_autoscaling_event_sink", None)
+        if sink is not None:
+            sink(name, value)
 
     def _publish_autoscaling_snapshot(self) -> None:
         if getattr(self, "_autoscaling_publish_defer_depth", 0) > 0:
@@ -601,12 +613,19 @@ class KVTokenTracker:
             "session_id": session_id,
         }
         selection = await self._svc.select_and_reserve(request)
+        worker_id = selection["worker_id"]
+        prefill_tokens_ahead = self._outstanding_prefill_tokens_by_worker.get(
+            worker_id, 0
+        )
         self._track_request_state(
             request_id,
-            selection["worker_id"],
+            worker_id,
             len(token_ids),
             expected_output_tokens,
             selection["effective_prefill_tokens"],
+        )
+        self._record_autoscaling_event(
+            PREFILL_ARRIVAL_AHEAD_TOKENS, prefill_tokens_ahead
         )
         self._publish_autoscaling_snapshot()
         if self._replica_forwarder is not None:
@@ -658,6 +677,7 @@ class KVTokenTracker:
             total_blocks=math.ceil(prompt_tokens / block_size),
         )
         self._outstanding_effective_prefill_tokens += effective_prefill_tokens
+        self._change_worker_prefill_load(worker_id, effective_prefill_tokens)
         self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
 
     async def on_lifecycle_events(self, events: List[tuple]) -> None:
@@ -695,6 +715,9 @@ class KVTokenTracker:
             return
         state.prefill_completed = True
         self._outstanding_effective_prefill_tokens -= state.effective_prefill_tokens
+        self._change_worker_prefill_load(
+            state.worker_id, -state.effective_prefill_tokens
+        )
         self._active_decode_requests += 1
         self._publish_autoscaling_snapshot()
         await self._svc.prefill_complete(request_id)
@@ -736,6 +759,20 @@ class KVTokenTracker:
             self._active_decode_requests -= 1
         else:
             self._outstanding_effective_prefill_tokens -= state.effective_prefill_tokens
+            self._change_worker_prefill_load(
+                state.worker_id, -state.effective_prefill_tokens
+            )
+
+    def _change_worker_prefill_load(self, worker_id: int, delta: int) -> None:
+        updated = self._outstanding_prefill_tokens_by_worker.get(worker_id, 0) + delta
+        if updated < 0:
+            raise RuntimeError(
+                f"Outstanding prefill load for worker {worker_id} became negative."
+            )
+        if updated == 0:
+            self._outstanding_prefill_tokens_by_worker.pop(worker_id, None)
+        else:
+            self._outstanding_prefill_tokens_by_worker[worker_id] = updated
 
     async def get_autoscaling_snapshot(self) -> Dict[str, int]:
         """Return this router replica's latest global LLM work estimate."""

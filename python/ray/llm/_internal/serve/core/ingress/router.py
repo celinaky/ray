@@ -183,6 +183,9 @@ class LLMRouter:
             self._kv_token_tracker.set_autoscaling_metrics_sink(
                 self._handle._set_router_autoscaling_metrics
             )
+            self._kv_token_tracker.set_autoscaling_event_sink(
+                self._handle._record_router_autoscaling_metric
+            )
 
     @router_app.post("/internal/route")
     async def route(self, request: Request):

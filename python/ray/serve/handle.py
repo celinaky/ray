@@ -142,6 +142,12 @@ class _DeploymentHandleBase(Generic[T]):
         """
         self._init_router().set_router_autoscaling_metrics(metrics_dict)
 
+    def _record_router_autoscaling_metric(
+        self, name: str, value: Union[int, float]
+    ) -> None:
+        """Record one router-owned autoscaling event for this handle."""
+        self._init_router().record_router_autoscaling_metric(name, value)
+
     @property
     def deployment_name(self) -> str:
         return self.deployment_id.name
