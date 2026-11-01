@@ -7,7 +7,8 @@ from ray.serve._private.constants import SERVE_AUTOSCALING_POLICY_METRICS_KEY
 from ray.serve.experimental.llm_token_autoscaling_policy import (
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
     PREFILL_ARRIVAL_AHEAD_TOKENS,
-    PREFILL_ARRIVAL_P95_TOKENS,
+    PREFILL_ARRIVAL_MEAN_TOKENS,
+    PREFILL_ARRIVAL_SAMPLES,
     PREFILL_REQUIRED_REPLICAS,
     REQUIRED_REPLICAS,
     LLMTokenAutoscalingPolicy,
@@ -54,8 +55,10 @@ def _context(
     )
 
 
-def test_decision_uses_prefill_p95_and_still_reports_snapshot_metrics():
-    policy = LLMTokenAutoscalingPolicy(target_prefill_tokens_per_replica=100)
+def test_decision_uses_arrival_mean_and_still_reports_snapshot_metrics():
+    policy = LLMTokenAutoscalingPolicy(
+        target_prefill_tokens_per_replica=100, min_arrival_samples=1
+    )
     ctx = _context(
         prefill_by_replica={"a": (99, 250), "b": (99, 200)},
         prefill_arrivals_by_router={"router": (99, 25)},
@@ -69,11 +72,12 @@ def test_decision_uses_prefill_p95_and_still_reports_snapshot_metrics():
 
 
 def test_scales_to_zero_when_idle():
-    policy = LLMTokenAutoscalingPolicy(100)
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=1)
 
     replicas, _ = policy(
         _context(
             prefill_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router={"router": (99, 0)},
             target_num_replicas=1,
         )
     )
@@ -82,9 +86,10 @@ def test_scales_to_zero_when_idle():
 
 
 def test_keeps_one_replica_when_requests_are_queued():
-    policy = LLMTokenAutoscalingPolicy(100)
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=1)
     ctx = _context(
         prefill_by_replica={"a": (99, 0)},
+        prefill_arrivals_by_router={"router": (99, 0)},
     )
     ctx.total_queued_requests = 1
 
@@ -108,15 +113,11 @@ def test_holds_target_for_missing_or_stale_snapshot(prefill_by_replica):
     assert state == {}
 
 
-def test_prefill_p95_concatenates_arrivals_across_routers():
-    policy = LLMTokenAutoscalingPolicy(100)
+def test_prefill_arrival_mean_combines_samples_across_routers():
+    policy = LLMTokenAutoscalingPolicy(10, min_arrival_samples=20)
     arrivals = {
         "router-a": [(80 + i, 10) for i in range(10)],
-        "router-b": [
-            *[(90 + i, 10) for i in range(8)],
-            (98, 150),
-            (99, 1000),
-        ],
+        "router-b": [(90 + i, 30) for i in range(10)],
     }
 
     replicas, state = policy(
@@ -128,16 +129,16 @@ def test_prefill_p95_concatenates_arrivals_across_routers():
         )
     )
 
-    # Nearest-rank p95 of 20 samples is the 19th value (150), not the max.
-    assert state[PREFILL_ARRIVAL_P95_TOKENS] == 150
+    assert state[PREFILL_ARRIVAL_MEAN_TOKENS] == 20
+    assert state[PREFILL_ARRIVAL_SAMPLES] == 20
     assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY][
         PREFILL_REQUIRED_REPLICAS
-    ] == pytest.approx(3)
-    assert replicas == 3
+    ] == pytest.approx(4)
+    assert replicas == 4
 
 
-def test_prefill_p95_uses_current_replica_count_as_scaling_basis():
-    policy = LLMTokenAutoscalingPolicy(100)
+def test_prefill_arrival_mean_uses_current_replica_count_as_scaling_basis():
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=1)
 
     replicas, _ = policy(
         _context(
@@ -151,8 +152,42 @@ def test_prefill_p95_uses_current_replica_count_as_scaling_basis():
     assert replicas == 3  # ceil(3 * 80 / 100)
 
 
-def test_prefill_p95_ignores_arrivals_before_window():
-    policy = LLMTokenAutoscalingPolicy(100, upscale_lookback_s=30)
+def test_holds_target_below_minimum_arrival_samples():
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=3)
+
+    replicas, state = policy(
+        _context(
+            prefill_by_replica={"a": (99, 1)},
+            prefill_arrivals_by_router={"router": [(98, 1000), (99, 1000)]},
+            current_num_replicas=2,
+            target_num_replicas=4,
+        )
+    )
+
+    assert state[PREFILL_ARRIVAL_MEAN_TOKENS] == 1000
+    assert state[PREFILL_ARRIVAL_SAMPLES] == 2
+    assert replicas == 4
+
+
+def test_uses_arrival_mean_at_minimum_sample_count():
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=3)
+
+    replicas, _ = policy(
+        _context(
+            prefill_by_replica={"a": (99, 1)},
+            prefill_arrivals_by_router={"router": [(97, 50), (98, 50), (99, 50)]},
+            current_num_replicas=2,
+            target_num_replicas=4,
+        )
+    )
+
+    assert replicas == 1  # ceil(2 current replicas * 50 mean / 100 target)
+
+
+def test_prefill_arrival_mean_ignores_arrivals_before_window():
+    policy = LLMTokenAutoscalingPolicy(
+        100, upscale_lookback_s=30, min_arrival_samples=1
+    )
 
     replicas, state = policy(
         _context(
@@ -164,7 +199,7 @@ def test_prefill_p95_ignores_arrivals_before_window():
         )
     )
 
-    assert state[PREFILL_ARRIVAL_P95_TOKENS] == 20
+    assert state[PREFILL_ARRIVAL_MEAN_TOKENS] == 20
     assert replicas == 1
 
 
@@ -183,8 +218,10 @@ def test_holds_target_when_no_snapshot_is_in_upscale_window():
     assert state == {}
 
 
-def test_scales_down_to_arrival_p95():
-    policy = LLMTokenAutoscalingPolicy(100, upscale_lookback_s=30)
+def test_scales_down_to_arrival_mean():
+    policy = LLMTokenAutoscalingPolicy(
+        100, upscale_lookback_s=30, min_arrival_samples=1
+    )
 
     replicas, state = policy(
         _context(
@@ -195,13 +232,15 @@ def test_scales_down_to_arrival_p95():
         )
     )
 
-    # ceil(7 current replicas * 25 arrival p95 / 100 target) = 2.
+    # ceil(7 current replicas * 25 arrival mean / 100 target) = 2.
     assert replicas == 2
     assert state["required_replicas"] == 2
 
 
-def test_publishes_prefill_p95_metrics():
-    policy = LLMTokenAutoscalingPolicy(100, upscale_lookback_s=30)
+def test_publishes_prefill_arrival_mean_metrics():
+    policy = LLMTokenAutoscalingPolicy(
+        100, upscale_lookback_s=30, min_arrival_samples=1
+    )
 
     replicas, state = policy(
         _context(
@@ -217,17 +256,19 @@ def test_publishes_prefill_p95_metrics():
     assert state[SERVE_AUTOSCALING_POLICY_METRICS_KEY] == {
         OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: 0,
         PREFILL_REQUIRED_REPLICAS: pytest.approx(1.5),
-        PREFILL_ARRIVAL_P95_TOKENS: 150,
+        PREFILL_ARRIVAL_MEAN_TOKENS: 150,
+        PREFILL_ARRIVAL_SAMPLES: 1,
         REQUIRED_REPLICAS: 2,
     }
 
 
 def test_proposes_zero_when_lookback_window_is_idle():
-    policy = LLMTokenAutoscalingPolicy(100)
+    policy = LLMTokenAutoscalingPolicy(100, min_arrival_samples=1)
 
     replicas, _ = policy(
         _context(
             prefill_by_replica={"a": (99, 0)},
+            prefill_arrivals_by_router={"router": (99, 0)},
             target_num_replicas=7,
         )
     )
@@ -247,6 +288,7 @@ def test_rejects_nonpositive_target():
         ({"upscale_lookback_s": 0}, "upscale_lookback_s"),
         ({"upscale_lookback_s": float("inf")}, "upscale_lookback_s"),
         ({"upscale_aggregation": "median"}, "upscale_aggregation"),
+        ({"min_arrival_samples": 0}, "min_arrival_samples"),
         ({"scale_down_sensitivity": 0}, "scale_down_sensitivity"),
         ({"scale_down_sensitivity": 1.1}, "scale_down_sensitivity"),
     ],

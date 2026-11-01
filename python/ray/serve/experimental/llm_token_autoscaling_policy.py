@@ -10,7 +10,7 @@ PREFILL_ARRIVAL_AHEAD_TOKENS = "prefill_arrival_ahead_tokens"
 
 # Policy metrics exported by the controller as serve_autoscaling_policy_metric.
 PREFILL_REQUIRED_REPLICAS = "prefill_required_replicas"
-PREFILL_ARRIVAL_P95_TOKENS = "prefill_arrival_p95_tokens"
+PREFILL_ARRIVAL_MEAN_TOKENS = "prefill_arrival_mean_tokens"
 PREFILL_ARRIVAL_SAMPLES = "prefill_arrival_samples"
 REQUIRED_REPLICAS = "required_replicas"
 
@@ -51,17 +51,17 @@ def _fresh_snapshots_by_source(
 class LLMTokenAutoscalingPolicy:
     """Scale an aggregated LLM deployment on outstanding uncached prefill tokens.
 
-    Prefill capacity follows the request-weighted p95 of uncached prefill tokens
+    Prefill capacity follows the request-weighted mean of uncached prefill tokens
     already ahead on the selected worker when each request arrived. Each router
     owns a disjoint subset of those arrival observations, so their samples are
-    concatenated rather than maximized.
+    combined before taking the mean.
 
-    The prefill p95 is a per-replica load observation. Its ratio to
+    The prefill arrival mean is a per-replica load observation. Its ratio to
     ``target_prefill_tokens_per_replica`` is therefore a scaling factor applied
     to the current replica count, not an absolute replica count.
 
     ``upscale_aggregation`` and ``scale_down_sensitivity`` are validated but
-    unused by the p95 policy.
+    unused by the arrival-mean policy.
     """
 
     def __init__(
@@ -93,24 +93,22 @@ class LLMTokenAutoscalingPolicy:
         self._upscale_aggregation = upscale_aggregation
         self._scale_down_sensitivity = scale_down_sensitivity
 
-    def _prefill_arrival_p95(
+    def _prefill_arrival_mean(
         self, ctx: AutoscalingContext, now: float
     ) -> Tuple[float, int]:
-        """Return the p95 and count of fresh router-local request-arrival samples."""
+        """Return the mean and count of fresh router-local arrival samples."""
         window_start = now - self._upscale_lookback_s
         raw_metrics = ctx.raw_router_metrics or {}
-        samples = sorted(
+        samples = [
             max(0, point.value)
             for series in raw_metrics.get(PREFILL_ARRIVAL_AHEAD_TOKENS, {}).values()
             for point in series
             if point.timestamp >= window_start
-        )
+        ]
         if not samples:
             return 0.0, 0
 
-        # Nearest-rank p95: the smallest observed value with at least 95% of
-        # request arrivals at or below it. This directly matches the SLO.
-        return samples[math.ceil(0.95 * len(samples)) - 1], len(samples)
+        return sum(samples) / len(samples), len(samples)
 
     def __call__(self, ctx: AutoscalingContext) -> Tuple[int, Dict[str, Any]]:
         if self._upscale_lookback_s > ctx.config.look_back_period_s:
@@ -134,14 +132,14 @@ class LLMTokenAutoscalingPolicy:
             # No observation in the lookback window is also fail-closed.
             return ctx.target_num_replicas, {}
 
-        prefill_arrival_p95, sample_count = self._prefill_arrival_p95(ctx, now)
+        prefill_arrival_mean, sample_count = self._prefill_arrival_mean(ctx, now)
         prefill_required_replicas = (
             ctx.current_num_replicas
-            * prefill_arrival_p95
+            * prefill_arrival_mean
             / self._target_prefill_tokens_per_replica
         )
         if sample_count < self._min_arrival_samples:
-            # Too few arrivals to trust a tail statistic: hold the current count.
+            # Too few arrivals to trust the aggregate: hold the current count.
             required_replicas = ctx.target_num_replicas
         else:
             required_replicas = math.ceil(prefill_required_replicas)
@@ -156,7 +154,7 @@ class LLMTokenAutoscalingPolicy:
             required_replicas = max(1, required_replicas)
         state: Dict[str, Any] = {
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
-            PREFILL_ARRIVAL_P95_TOKENS: prefill_arrival_p95,
+            PREFILL_ARRIVAL_MEAN_TOKENS: prefill_arrival_mean,
             PREFILL_ARRIVAL_SAMPLES: sample_count,
             REQUIRED_REPLICAS: required_replicas,
             "lookback_s": self._upscale_lookback_s,
@@ -164,7 +162,7 @@ class LLMTokenAutoscalingPolicy:
             SERVE_AUTOSCALING_POLICY_METRICS_KEY: {
                 OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
                 PREFILL_REQUIRED_REPLICAS: prefill_required_replicas,
-                PREFILL_ARRIVAL_P95_TOKENS: prefill_arrival_p95,
+                PREFILL_ARRIVAL_MEAN_TOKENS: prefill_arrival_mean,
                 PREFILL_ARRIVAL_SAMPLES: sample_count,
                 REQUIRED_REPLICAS: required_replicas,
             },
