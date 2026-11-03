@@ -13,7 +13,10 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.renderers import renderer_from_config
-from vllm.renderers.chat_utils import load_chat_template
+try:
+    from vllm.renderers.chat_utils import load_chat_template
+except ImportError:  # vLLM < 0.32 keeps it under entrypoints.
+    from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
 
