@@ -67,6 +67,11 @@ def _time_weighted_mean(
 class LLMTokenAutoscalingPolicy:
     """Scale an aggregated LLM deployment on outstanding uncached prefill tokens.
 
+    Set ``target_queue_time_ms`` instead of a fixed token target to consume
+    router queue-model snapshots. Until a fresh usable model is available,
+    learned mode holds the current target replica count. The router must enable
+    prefill queue learning and disable prefill decay.
+
     Both directions follow the time-weighted mean over ``upscale_lookback_s``
     of the router's outstanding effective (uncached) prefill tokens divided by
     ``target_prefill_tokens_per_replica``. Router replicas report the same
@@ -81,12 +86,27 @@ class LLMTokenAutoscalingPolicy:
 
     def __init__(
         self,
-        target_prefill_tokens_per_replica: int,
+        target_prefill_tokens_per_replica: int = None,
         upscale_lookback_s: float = 30,
         upscale_aggregation: _UpscaleAggregation = "max",
         scale_down_sensitivity: float = 0.8,
+        target_queue_time_ms: float = None,
     ):
-        if target_prefill_tokens_per_replica <= 0:
+        if (target_prefill_tokens_per_replica is None) == (
+            target_queue_time_ms is None
+        ):
+            raise ValueError(
+                "Specify exactly one fixed token target or target_queue_time_ms"
+            )
+        self._target_queue_time_ms = target_queue_time_ms
+        if target_queue_time_ms is not None and (
+            not math.isfinite(target_queue_time_ms) or target_queue_time_ms <= 0
+        ):
+            raise ValueError("target_queue_time_ms must be positive and finite")
+        if (
+            target_prefill_tokens_per_replica is not None
+            and target_prefill_tokens_per_replica <= 0
+        ):
             raise ValueError("target_prefill_tokens_per_replica must be positive")
         if not math.isfinite(upscale_lookback_s) or upscale_lookback_s <= 0:
             raise ValueError("upscale_lookback_s must be positive and finite")
@@ -157,6 +177,57 @@ class LLMTokenAutoscalingPolicy:
             # No observation in the lookback window is also fail-closed.
             return ctx.target_num_replicas, {}
 
+        learned_metrics = {}
+        if self._target_queue_time_ms is not None:
+            raw = ctx.raw_router_metrics or {}
+            prefix = "prefill_queue_model_"
+            budgets = []
+            for source in snapshots_by_source:
+                fields = {}
+                stamps = []
+                for field in (
+                    "intercept_ms",
+                    "slope_ms_per_token",
+                    "sample_count",
+                    "updated_at_s",
+                    "version",
+                ):
+                    series = raw.get(prefix + field, {}).get(source, [])
+                    if (
+                        not series
+                        or series[-1].timestamp < now - ctx.config.look_back_period_s
+                    ):
+                        break
+                    fields[field] = series[-1].value
+                    stamps.append(series[-1].timestamp)
+                if len(fields) != 5 or len(set(stamps)) != 1:
+                    continue
+                a, b = fields["intercept_ms"], fields["slope_ms_per_token"]
+                if not all(math.isfinite(v) for v in fields.values()) or b <= 0:
+                    continue
+                budget = (self._target_queue_time_ms - a) / b
+                if math.isfinite(budget) and budget > 0:
+                    budgets.append((max(1, math.floor(budget)), fields))
+            if not budgets:
+                return ctx.target_num_replicas, {
+                    "reason": "no_usable_queue_model",
+                    SERVE_AUTOSCALING_POLICY_METRICS_KEY: {
+                        "prefill_queue_model_ready": 0,
+                        "target_queue_time_ms": self._target_queue_time_ms,
+                        OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: max(
+                            max(0, values[-1][1])
+                            for values in snapshots_by_source.values()
+                        ),
+                        REQUIRED_REPLICAS: ctx.target_num_replicas,
+                    },
+                }
+            budget, fields = min(budgets, key=lambda item: item[0])
+            self._target_prefill_tokens_per_replica = budget
+            learned_metrics = {prefix + key: value for key, value in fields.items()}
+            learned_metrics["learned_prefill_tokens_per_replica"] = budget
+            learned_metrics["target_queue_time_ms"] = self._target_queue_time_ms
+            learned_metrics["prefill_queue_model_ready"] = 1
+
         prefill_required_replicas = self._mean_required_capacity(
             snapshots_by_source, now
         )
@@ -173,6 +244,7 @@ class LLMTokenAutoscalingPolicy:
             REQUIRED_REPLICAS: required_replicas,
             "lookback_s": self._upscale_lookback_s,
             SERVE_AUTOSCALING_POLICY_METRICS_KEY: {
+                **learned_metrics,
                 OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
                 PREFILL_REQUIRED_REPLICAS: prefill_required_replicas,
                 REQUIRED_REPLICAS: required_replicas,

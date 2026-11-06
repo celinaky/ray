@@ -615,6 +615,19 @@ class VLLMEngine(LLMEngine):
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.executor.abstract import Executor
 
+        router_config = (
+            self.llm_config.deployment_config.get("request_router_config") or {}
+        )
+        router_kwargs = (
+            router_config.get("request_router_kwargs", {})
+            if isinstance(router_config, dict)
+            else router_config.request_router_kwargs
+        )
+        if (
+            router_kwargs.get("enable_prefill_queue_learning")
+            and vllm_engine_args.disable_log_stats
+        ):
+            raise ValueError("Prefill queue learning requires disable_log_stats=False")
         vllm_engine_config.parallel_config.placement_group = placement_group
         from ray.llm._internal.serve.engines.vllm.scheduler_trace import (
             configure_scheduler_trace,

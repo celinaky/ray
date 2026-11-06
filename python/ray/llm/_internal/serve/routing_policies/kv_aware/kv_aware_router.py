@@ -54,6 +54,10 @@ class KVAwareRouter(MultiplexMixin, RequestRouter):
         self,
         session_affinity_ttl_s: float = DEFAULT_SESSION_AFFINITY_TTL_S,
         prefill_decay_tokens_per_second: float = 0.0,
+        enable_prefill_queue_learning: bool = False,
+        calibration_min_samples: int = 100,
+        calibration_window_samples: int = 1000,
+        calibration_refresh_interval_s: float = 120,
     ):
         """Bind to the ``KVTokenTracker`` the LLMRouter registered in this
         process. When absent (e.g. the proxy's fallback router), KV-aware
@@ -68,6 +72,14 @@ class KVAwareRouter(MultiplexMixin, RequestRouter):
                 this capacity on the oldest outstanding prefill first and
                 publishes the remaining total for token autoscaling. Defaults
                 to ``0`` (disabled). This doesn't change Dynamo's routing load.
+            enable_prefill_queue_learning: Enable learning a token budget from
+                native engine queue-time observations. Defaults to False.
+            calibration_min_samples: Minimum observations required for a fit.
+                Defaults to 100.
+            calibration_window_samples: Maximum observations retained for each
+                fit. Defaults to 1000.
+            calibration_refresh_interval_s: Seconds between model refreshes
+                after the initial fit. Defaults to 120.
         """
         self._kv_token_tracker = get_kv_token_tracker()
         if self._kv_token_tracker is None:

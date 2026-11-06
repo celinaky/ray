@@ -263,6 +263,10 @@ class KVTokenTracker:
         serve_deployment_id: Optional[Any] = None,
         session_affinity_ttl_s: float = DEFAULT_SESSION_AFFINITY_TTL_S,
         prefill_decay_tokens_per_second: float = 0.0,
+        enable_prefill_queue_learning: bool = False,
+        calibration_min_samples: int = 100,
+        calibration_window_samples: int = 1000,
+        calibration_refresh_interval_s: float = 120,
     ):
         if (
             isinstance(prefill_decay_tokens_per_second, bool)
@@ -275,6 +279,20 @@ class KVTokenTracker:
             )
         # The tracked LLMServer deployment id, passed in by the LLMRouter
         # that builds the tracker.
+        self._calibrator = None
+        self._calibration_pending = {}
+        self._worker_prefill_tokens = {}
+        self._calibration_timer = None
+        if enable_prefill_queue_learning:
+            if prefill_decay_tokens_per_second:
+                raise ValueError("Prefill queue learning requires decay disabled")
+            from .prefill_calibration import PrefillQueueCalibrator
+
+            self._calibrator = PrefillQueueCalibrator(
+                calibration_min_samples,
+                calibration_window_samples,
+                calibration_refresh_interval_s,
+            )
         self._serve_deployment_id = serve_deployment_id
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
@@ -429,9 +447,36 @@ class KVTokenTracker:
         """Set the local sink for router-owned autoscaling metrics."""
         self._autoscaling_metrics_sink = sink
         self._publish_autoscaling_snapshot()
+        if self._calibrator and self._calibration_timer is None:
+            self._schedule_calibration_refresh()
+
+    def close_calibration(self):
+        if self._calibration_timer is not None:
+            self._calibration_timer.cancel()
+            self._calibration_timer = None
+        if self._calibrator and self._calibrator.audit:
+            self._calibrator.audit.close()
+
+    def _schedule_calibration_refresh(self):
+        delay = max(
+            0,
+            self._calibrator.last_refresh
+            + self._calibrator.refresh_interval_s
+            - time.monotonic(),
+        )
+        self._calibration_timer = asyncio.get_running_loop().call_later(
+            delay, self._refresh_calibration
+        )
+
+    def _refresh_calibration(self):
+        self._calibration_timer = None
+        self._calibrator.refresh()
+        self._publish_autoscaling_snapshot()
+        self._schedule_calibration_refresh()
 
     def _get_autoscaling_snapshot(self) -> Dict[str, int]:
         return {
+            **(self._calibrator.model if self._calibrator else {}),
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: (
                 self._prefill_decay.remaining_tokens()
                 if self._prefill_decay is not None
@@ -714,6 +759,20 @@ class KVTokenTracker:
             "session_id": session_id,
         }
         selection = await self._svc.select_and_reserve(request)
+        if self._calibrator is not None:
+            self._calibration_pending[request_id] = dict(
+                worker_id=selection["worker_id"],
+                workload_tokens=self._worker_prefill_tokens.get(
+                    selection["worker_id"], 0
+                ),
+                routed_at_s=time.time(),
+                prompt_tokens=len(token_ids),
+                router_effective_prefill_tokens=selection["effective_prefill_tokens"],
+                router_overlap_longest_matched=selection["overlap"]["longest_matched"],
+            )
+            self._calibrator.record_routing(
+                request_id, self._calibration_pending[request_id]
+            )
         self._track_request_state(
             request_id,
             selection["worker_id"],
@@ -770,6 +829,9 @@ class KVTokenTracker:
             expected_output_tokens=expected_output_tokens,
             total_blocks=math.ceil(prompt_tokens / block_size),
         )
+        self._worker_prefill_tokens[worker_id] = (
+            self._worker_prefill_tokens.get(worker_id, 0) + effective_prefill_tokens
+        )
         self._outstanding_effective_prefill_tokens += effective_prefill_tokens
         if self._prefill_decay is not None:
             self._prefill_decay.add(request_id, worker_id, effective_prefill_tokens)
@@ -802,7 +864,9 @@ class KVTokenTracker:
         finally:
             self._flush_autoscaling_snapshot()
 
-    async def on_prefill_complete(self, request_id: str) -> None:
+    async def on_prefill_complete(
+        self, request_id: str, queue_time_ms: Optional[float] = None
+    ) -> None:
         """Record a request's prefill -> decode transition, dropping its prefill
         load in the selection service."""
         state = self._requests.get(request_id)
@@ -810,6 +874,10 @@ class KVTokenTracker:
             return
         if self._prefill_decay is not None:
             self._prefill_decay.remove(request_id, state.worker_id)
+        snapshot = self._calibration_pending.pop(request_id, None)
+        if snapshot is not None and self._calibrator is not None:
+            self._calibrator.observe(request_id, snapshot, queue_time_ms)
+        self._worker_prefill_tokens[state.worker_id] -= state.effective_prefill_tokens
         state.prefill_completed = True
         self._outstanding_effective_prefill_tokens -= state.effective_prefill_tokens
         self._active_decode_requests += 1
@@ -853,6 +921,11 @@ class KVTokenTracker:
         """Remove one request's contribution from its current lifecycle phase."""
         if self._prefill_decay is not None:
             self._prefill_decay.remove(request_id, state.worker_id)
+        self._calibration_pending.pop(request_id, None)
+        if not state.prefill_completed:
+            self._worker_prefill_tokens[
+                state.worker_id
+            ] -= state.effective_prefill_tokens
         if state.prefill_completed:
             self._active_decode_requests -= 1
         else:
@@ -959,6 +1032,16 @@ def build_kv_token_tracker(
         ),
         prefill_decay_tokens_per_second=router_kwargs.get(
             "prefill_decay_tokens_per_second", 0.0
+        ),
+        enable_prefill_queue_learning=router_kwargs.get(
+            "enable_prefill_queue_learning", False
+        ),
+        calibration_min_samples=router_kwargs.get("calibration_min_samples", 100),
+        calibration_window_samples=router_kwargs.get(
+            "calibration_window_samples", 1000
+        ),
+        calibration_refresh_interval_s=router_kwargs.get(
+            "calibration_refresh_interval_s", 120
         ),
         indexer_threads=llm_config.experimental_configs.get(
             KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS

@@ -379,6 +379,12 @@ class SchedulerTraceMixin:
                 "phase": "prefill" if is_prefill else "decode",
                 "prompt_tokens": prompt_tokens,
                 "cached_prefix_tokens": cached_tokens,
+                "local_cached_prefix_tokens": getattr(
+                    prefill_stats, "num_local_cached_tokens", None
+                ),
+                "external_cached_prefix_tokens": getattr(
+                    prefill_stats, "num_external_cached_tokens", None
+                ),
                 "computed_before": before,
                 "completed_or_cached_before": completed_or_cached_before,
                 "locally_computed_before": max(
@@ -498,6 +504,8 @@ class SchedulerTraceMixin:
                 ),
                 prompt_tokens=entry["prompt_tokens"],
                 cached_prefix_tokens=entry["cached_prefix_tokens"],
+                local_cached_prefix_tokens=entry["local_cached_prefix_tokens"],
+                external_cached_prefix_tokens=entry["external_cached_prefix_tokens"],
                 scheduled_tokens=entry["scheduled_tokens"],
             )
         for request_id in sorted(scheduler_output.preempted_req_ids or ()):

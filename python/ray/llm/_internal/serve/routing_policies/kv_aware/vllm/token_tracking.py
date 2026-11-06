@@ -122,7 +122,20 @@ class RequestTokenTracker:
         if not self._prefill_marked:
             # The first output token signals prefill completion.
             self._prefill_marked = True
-            self._forwarder.report("on_prefill_complete", self._request_id)
+            metrics = getattr(output, "metrics", None)
+            queue_ms = None
+            if (
+                metrics is not None
+                and metrics.queued_ts > 0
+                and metrics.scheduled_ts >= metrics.queued_ts
+            ):
+                queue_ms = 1000 * (metrics.scheduled_ts - metrics.queued_ts)
+            if queue_ms is None:
+                self._forwarder.report("on_prefill_complete", self._request_id)
+            else:
+                self._forwarder.report(
+                    "on_prefill_complete", self._request_id, queue_ms
+                )
         if self._report_decode_progress:
             self._forwarder.report(
                 "on_decode_progress", self._request_id, self._cumulative

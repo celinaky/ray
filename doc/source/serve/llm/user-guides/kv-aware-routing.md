@@ -249,3 +249,50 @@ If the ingress router fails to route a request, Ray Serve LLM can send it to an 
 - {doc}`Prefix-aware routing <prefix-aware-routing>` - Text-based cache affinity without the extra dependency
 - {ref}`routing-policies-guide` - Request routing concepts and available policies
 - [Dynamo standalone selection service](https://docs.nvidia.com/dynamo/knowledge-base/modular-components/router/standalone-selection) - The selection service that scores replicas, and its full settings
+
+## Online prefill-token calibration (experimental)
+
+The experimental token policy can learn a token budget for a **mean initial
+engine queue-time** target. Configure the LLM deployment's autoscaling policy:
+
+```yaml
+policy:
+  policy_function: ray.serve.experimental.llm_token_autoscaling_policy:LLMTokenAutoscalingPolicy
+  policy_kwargs:
+    target_queue_time_ms: 2000
+```
+
+In `request_router_config.request_router_kwargs`, set
+`enable_prefill_queue_learning: true`. Optional settings are
+`calibration_min_samples: 100`, `calibration_window_samples: 1000`, and
+`calibration_refresh_interval_s: 120`. Keep `prefill_decay_tokens_per_second: 0`
+and `engine_kwargs.disable_log_stats: false`. Do not also set a fixed token target.
+
+Each ingress router learns from its own requests using the selected worker's
+undecayed reservations before adding the incoming request, paired with native
+vLLM `scheduled_ts - queued_ts` reported at first output. This is a routing-time
+estimate, not reconstructed remaining GPU work. Non-streaming final-only outputs
+delay observation until completion. Learning needs traffic on initial replicas.
+
+Until a valid model is published, the policy holds its current target replica
+count. Thereafter it uses the smallest eligible budget across fresh router
+reports. The router attempts its first fit as soon as it receives the minimum
+number of valid samples and publishes valid coefficients through the next
+ordinary metrics report. Later attempts follow the refresh interval, measured
+from that first fit. Ordinary metric transport repeats the last snapshot.
+Fixed-token configurations are unchanged.
+
+For reproducible diagnostics, set the routers' environment variable
+`RAY_SERVE_LLM_PREFILL_CALIBRATION_TRACE_DIR` to shared writable storage. JSONL
+records contain accepted samples and complete rolling windows for every fit
+attempt, with coefficients, router boot identity, and published model versions.
+Audit writing is bounded and best effort; dropped records and missing clean
+shutdown markers must be treated as incomplete verification. No prompt text or
+token IDs are recorded.
+
+Scheduler tracing can be enabled independently for validation with
+`RAY_SERVE_VLLM_SCHEDULER_TRACE_DIR`. The learner continues to use native vLLM
+queue-time labels. Calibration audits also record each routing decision's
+individual effective prefill reservation before its first output, allowing
+request-ID joins against the scheduler trace even if a request is cancelled.
+Scheduler admission records include local and external cached-token counts.

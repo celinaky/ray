@@ -160,7 +160,9 @@ def test_scheduler_trace_records_request_batch_and_first_token(monkeypatch, tmp_
         num_computed_tokens=4,
         num_in_flight_tokens=0,
         num_preemptions=0,
-        prefill_stats=SimpleNamespace(num_cached_tokens=2),
+        prefill_stats=SimpleNamespace(
+            num_cached_tokens=2, num_local_cached_tokens=1, num_external_cached_tokens=1
+        ),
     )
 
     scheduler.add_request(request)
@@ -183,6 +185,8 @@ def test_scheduler_trace_records_request_batch_and_first_token(monkeypatch, tmp_
             "phase": "prefill",
             "prompt_tokens": 13,
             "cached_prefix_tokens": 2,
+            "local_cached_prefix_tokens": 1,
+            "external_cached_prefix_tokens": 1,
             "computed_before": 4,
             "completed_or_cached_before": 4,
             "locally_computed_before": 2,
@@ -196,5 +200,7 @@ def test_scheduler_trace_records_request_batch_and_first_token(monkeypatch, tmp_
 
     assert event_by_name["request_first_token"]["batches_waited"] == 0
     assert event_by_name["request_admitted"]["cached_prefix_tokens"] == 2
+    assert event_by_name["request_admitted"]["local_cached_prefix_tokens"] == 1
+    assert event_by_name["request_admitted"]["external_cached_prefix_tokens"] == 1
     assert event_by_name["batch_completed"]["first_token_request_ids"] == ["request-1"]
     assert event_by_name["request_finished"]["external_request_id"] == "client-1"
