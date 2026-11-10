@@ -4,6 +4,7 @@ import sys
 from collections import OrderedDict
 from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -136,6 +137,7 @@ class RecordingKVTokenTracker(KVTokenTracker):
         self._outstanding_effective_prefill_tokens = 0
         self._active_decode_requests = 0
         self._autoscaling_metrics_callback = None
+        self._uncached_prefill_tokens_gauge = Mock()
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
         self._pending_tasks = set()
@@ -190,6 +192,7 @@ class LocalKVTokenTracker(KVTokenTracker):
         self._outstanding_effective_prefill_tokens = 0
         self._active_decode_requests = 0
         self._autoscaling_metrics_callback = None
+        self._uncached_prefill_tokens_gauge = Mock()
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
         self._pending_tasks = set()
@@ -771,6 +774,7 @@ async def test_autoscaling_snapshot_tracks_request_phases():
         ACTIVE_DECODE_REQUESTS: 0,
     }
     assert published[-1] == await actor.get_autoscaling_snapshot()
+    actor._uncached_prefill_tokens_gauge.set.assert_called_with(3)
 
     await actor.on_prefill_complete("cached")
     expected = {
@@ -779,6 +783,7 @@ async def test_autoscaling_snapshot_tracks_request_phases():
     }
     assert await actor.get_autoscaling_snapshot() == expected
     assert published[-1] == expected
+    actor._uncached_prefill_tokens_gauge.set.assert_called_with(0)
 
     # Duplicate lifecycle events are idempotent.
     await actor.on_prefill_complete("cached")
