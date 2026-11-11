@@ -53,20 +53,33 @@ class LLMTokenAutoscalingPolicy:
         target_prefill_tokens_per_replica: Mean outstanding uncached prefill tokens
             that one replica should handle.
         upscale_lookback_s: Window used for the time-weighted mean.
+        post_downscale_cooldown_s: Hold the current replica target for this many
+            seconds after Serve accepts a downscale. Defaults to zero (disabled).
+            When enabled, both autoscaling factors must be one so Serve preserves
+            the held target while replicas are draining. Workload snapshots still
+            update during the cooldown. Serve's scale-from-zero fast path remains
+            active.
     """
 
     def __init__(
         self,
         target_prefill_tokens_per_replica: int,
         upscale_lookback_s: float = 30,
+        post_downscale_cooldown_s: float = 0,
     ):
         if target_prefill_tokens_per_replica <= 0:
             raise ValueError("target_prefill_tokens_per_replica must be positive")
         if not math.isfinite(upscale_lookback_s) or upscale_lookback_s <= 0:
             raise ValueError("upscale_lookback_s must be positive and finite")
+        if (
+            not math.isfinite(post_downscale_cooldown_s)
+            or post_downscale_cooldown_s < 0
+        ):
+            raise ValueError("post_downscale_cooldown_s must be nonnegative and finite")
 
         self._target_prefill_tokens_per_replica = target_prefill_tokens_per_replica
         self._upscale_lookback_s = upscale_lookback_s
+        self._post_downscale_cooldown_s = post_downscale_cooldown_s
 
     def _required_capacity(self, prefill_tokens: float) -> float:
         return prefill_tokens / self._target_prefill_tokens_per_replica
@@ -106,6 +119,14 @@ class LLMTokenAutoscalingPolicy:
                 "upscale_lookback_s must not exceed the autoscaling config's "
                 "look_back_period_s"
             )
+        if self._post_downscale_cooldown_s > 0 and (
+            ctx.config.get_upscaling_factor() != 1
+            or ctx.config.get_downscaling_factor() != 1
+        ):
+            raise ValueError(
+                "post_downscale_cooldown_s requires upscaling and downscaling "
+                "factors of 1"
+            )
 
         snapshots_by_source = _prefill_snapshots_by_source(ctx)
         mean_required_capacity = self._mean_required_capacity(snapshots_by_source)
@@ -119,7 +140,18 @@ class LLMTokenAutoscalingPolicy:
         outstanding_prefill_tokens = max(
             snapshots[-1][1] for snapshots in snapshots_by_source.values()
         )
-        return required_replicas, {
+        decision_replicas = required_replicas
+        if (
+            self._post_downscale_cooldown_s > 0
+            and ctx.last_scale_down_time is not None
+            and ctx.current_time - ctx.last_scale_down_time
+            < self._post_downscale_cooldown_s
+            and not (ctx.current_num_replicas == 0 and ctx.total_queued_requests > 0)
+        ):
+            # Keep the accepted target, not the running count: draining replicas
+            # can still be running after Serve has committed a downscale.
+            decision_replicas = ctx.target_num_replicas
+        return decision_replicas, {
             OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: outstanding_prefill_tokens,
             REQUIRED_REPLICAS: required_replicas,
         }
