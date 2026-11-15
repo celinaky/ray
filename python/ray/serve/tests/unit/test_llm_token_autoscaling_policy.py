@@ -4,7 +4,12 @@ import sys
 import pytest
 
 from ray.serve._private.common import DeploymentID
-from ray.serve.config import AutoscalingContext
+from ray.serve._private.constants import (
+    SERVE_AUTOSCALING_DECISION_COUNTERS_KEY,
+    SERVE_AUTOSCALING_DECISION_TIMESTAMP_KEY,
+)
+from ray.serve.autoscaling_policy import _apply_autoscaling_config
+from ray.serve.config import AutoscalingConfig, AutoscalingContext
 from ray.serve.experimental.llm_token_autoscaling_policy import (
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
     REQUIRED_REPLICAS,
@@ -25,6 +30,11 @@ class TestLLMTokenAutoscalingPolicy:
         aggregated_router_metrics=_UNSET,
         target_num_replicas=2,
         total_num_requests=0,
+        current_num_replicas=None,
+        config=None,
+        current_time=100,
+        last_scale_down_time=None,
+        policy_state=None,
     ):
         if aggregated_router_metrics is _UNSET:
             aggregated_router_metrics = {
@@ -34,7 +44,11 @@ class TestLLMTokenAutoscalingPolicy:
             deployment_id=DeploymentID(name="test", app_name="app"),
             deployment_name="test",
             app_name="app",
-            current_num_replicas=target_num_replicas,
+            current_num_replicas=(
+                target_num_replicas
+                if current_num_replicas is None
+                else current_num_replicas
+            ),
             target_num_replicas=target_num_replicas,
             running_replicas=[],
             total_num_requests=total_num_requests,
@@ -43,11 +57,11 @@ class TestLLMTokenAutoscalingPolicy:
             raw_metrics=None,
             capacity_adjusted_min_replicas=0,
             capacity_adjusted_max_replicas=100,
-            policy_state={},
+            policy_state=policy_state or {},
             last_scale_up_time=None,
-            last_scale_down_time=None,
-            current_time=None,
-            config=None,
+            last_scale_down_time=last_scale_down_time,
+            current_time=current_time,
+            config=config or AutoscalingConfig(min_replicas=0, max_replicas=100),
             aggregated_router_metrics=aggregated_router_metrics,
         )
 
@@ -155,6 +169,213 @@ class TestLLMTokenAutoscalingPolicy:
         """Rejects a target that is not positive and finite."""
         with pytest.raises(ValueError, match="positive and finite"):
             LLMTokenAutoscalingPolicy(target_prefill_tokens_per_replica=target)
+
+    @pytest.mark.parametrize("tokens", [0, 1000])
+    @pytest.mark.parametrize("running_replicas", [2, 3, 4])
+    def test_cooldown_holds_accepted_target_and_reports_workload(
+        self, tokens, running_replicas
+    ):
+        """Holds the accepted target after a downscale but still reports workload."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        replicas, state = policy(
+            self._make_ctx(
+                prefill_by_handle={"a": float(tokens)},
+                target_num_replicas=3,
+                current_num_replicas=running_replicas,
+                last_scale_down_time=100,
+                current_time=159,
+            )
+        )
+
+        assert replicas == 3
+        assert state[OUTSTANDING_EFFECTIVE_PREFILL_TOKENS] == tokens
+        assert state[REQUIRED_REPLICAS] == math.ceil(tokens / 100)
+
+    @pytest.mark.parametrize("tokens", [0, 1000])
+    @pytest.mark.parametrize("now", [160, 200])
+    def test_cooldown_expires_without_extending_on_policy_calls(self, tokens, now):
+        """Ends the hold at the deadline even though the policy runs every tick."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        for current_time in [100, 130, 159, now]:
+            replicas, _ = policy(
+                self._make_ctx(
+                    prefill_by_handle={"a": float(tokens)},
+                    target_num_replicas=3,
+                    last_scale_down_time=100,
+                    current_time=current_time,
+                )
+            )
+            assert replicas == (3 if current_time < 160 else math.ceil(tokens / 100))
+
+    @pytest.mark.parametrize("last_scale_down_time", [None, 0])
+    def test_cooldown_does_not_start_on_running_replica_loss(
+        self, last_scale_down_time
+    ):
+        """Losing a running replica without an accepted downscale starts no hold."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        replicas, _ = policy(
+            self._make_ctx(
+                prefill_by_handle={"a": 1000.0},
+                target_num_replicas=3,
+                current_num_replicas=2,
+                last_scale_down_time=last_scale_down_time,
+                current_time=100,
+            )
+        )
+
+        assert replicas == 10
+
+    def test_cooldown_uses_latest_downscale_timestamp(self):
+        """Times the hold from the most recent accepted downscale."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        for last_downscale, target, expected in [(100, 3, 10), (160, 2, 2)]:
+            replicas, _ = policy(
+                self._make_ctx(
+                    prefill_by_handle={"a": 1000.0},
+                    target_num_replicas=target,
+                    last_scale_down_time=last_downscale,
+                    current_time=170,
+                )
+            )
+            assert replicas == expected
+
+    def test_cooldown_disabled_by_default(self):
+        """Scales normally right after a downscale when no cooldown is set."""
+        policy = LLMTokenAutoscalingPolicy(target_prefill_tokens_per_replica=100)
+
+        replicas, _ = policy(
+            self._make_ctx(prefill_by_handle={"a": 1000.0}, last_scale_down_time=100)
+        )
+
+        assert replicas == 10
+
+    def test_cooldown_with_missing_metric(self):
+        """Holds the target when no router has reported the metric."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        assert policy(
+            self._make_ctx(
+                aggregated_router_metrics={},
+                target_num_replicas=3,
+                last_scale_down_time=100,
+            )
+        ) == (3, {})
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_cooldown_preserves_scale_from_zero(self, wrapped):
+        """Starts a replica for queued requests even during the hold."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+        if wrapped:
+            policy = _apply_autoscaling_config(policy)
+
+        replicas, _ = policy(
+            self._make_ctx(
+                prefill_by_handle={"a": 0.0},
+                target_num_replicas=0,
+                current_num_replicas=0,
+                total_num_requests=1,
+                last_scale_down_time=100,
+            )
+        )
+
+        assert replicas == 1
+
+    @pytest.mark.parametrize("tokens, expected", [(100, 1), (1000, 10)])
+    def test_wrapped_policy_resets_delays_during_cooldown(
+        self, monkeypatch, tokens, expected
+    ):
+        """Serve's delay timers restart after the hold instead of firing at its end."""
+        policy = _apply_autoscaling_config(
+            LLMTokenAutoscalingPolicy(
+                target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+            )
+        )
+        config = AutoscalingConfig(
+            min_replicas=0,
+            max_replicas=100,
+            upscale_delay_s=10,
+            downscale_delay_s=10,
+        )
+        state = {
+            SERVE_AUTOSCALING_DECISION_COUNTERS_KEY: 1,
+            SERVE_AUTOSCALING_DECISION_TIMESTAMP_KEY: 100,
+        }
+
+        for now in [150, 159, 160, 169, 170]:
+            monkeypatch.setattr("ray.serve.autoscaling_policy.time.time", lambda: now)
+            replicas, state = policy(
+                self._make_ctx(
+                    prefill_by_handle={"a": float(tokens)},
+                    config=config,
+                    current_num_replicas=4,
+                    target_num_replicas=3,
+                    current_time=now,
+                    last_scale_down_time=100,
+                    policy_state=state,
+                )
+            )
+            assert replicas == (3 if now < 170 else expected)
+            if now < 160:
+                assert state[SERVE_AUTOSCALING_DECISION_COUNTERS_KEY] == 0
+                assert state[SERVE_AUTOSCALING_DECISION_TIMESTAMP_KEY] is None
+
+    @pytest.mark.parametrize("duration", [-1, math.inf, -math.inf, math.nan])
+    def test_rejects_invalid_cooldown(self, duration):
+        """Rejects a cooldown that is negative or not finite."""
+        with pytest.raises(ValueError, match="nonnegative and finite"):
+            LLMTokenAutoscalingPolicy(
+                target_prefill_tokens_per_replica=100,
+                post_downscale_cooldown_s=duration,
+            )
+
+    @pytest.mark.parametrize(
+        "factor",
+        [
+            {"upscaling_factor": 2},
+            {"downscaling_factor": 0.5},
+            {"smoothing_factor": 0.5},
+        ],
+    )
+    def test_cooldown_rejects_factors_that_can_change_held_target(self, factor):
+        """Rejects scaling factors that would let Serve change the held target."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, post_downscale_cooldown_s=60
+        )
+
+        with pytest.raises(
+            ValueError, match="requires upscaling and downscaling factors of 1"
+        ):
+            policy(self._make_ctx(config=AutoscalingConfig(**factor)))
+
+    def test_disabled_cooldown_allows_custom_scaling_factors(self):
+        """Allows any scaling factors when the cooldown is off."""
+        policy = LLMTokenAutoscalingPolicy(target_prefill_tokens_per_replica=100)
+
+        replicas, _ = policy(
+            self._make_ctx(
+                config=AutoscalingConfig(upscaling_factor=2, downscaling_factor=0.5),
+                prefill_by_handle={"a": 1000.0},
+                last_scale_down_time=100,
+            )
+        )
+
+        assert replicas == 10
 
 
 if __name__ == "__main__":
