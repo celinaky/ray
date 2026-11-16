@@ -50,6 +50,13 @@ DEFAULT_KV_INDEXER_THREADS = 4
 # KVTokenTracker publishes the snapshot via set_autoscaling_metrics_callback.
 OUTSTANDING_EFFECTIVE_PREFILL_TOKENS = "outstanding_effective_prefill_tokens"
 
+# With ``prefill_decay_tokens_per_second`` set, the reported prefill tokens
+# decay between lifecycle events, so the tracker republishes its snapshot at
+# this interval while any prefill tokens are outstanding.
+PREFILL_DECAY_PUBLISH_INTERVAL_S = get_env_float_positive(
+    "RAY_SERVE_LLM_PREFILL_DECAY_PUBLISH_INTERVAL_S", 0.5
+)
+
 # The engine's KV-event replay (ROUTER) socket sits this many ports above its PUB
 # port, a separate range so it never collides with the PUB ports of colocated
 # replicas (PORT_BASE + replica rank). Dynamo's selection service dials it to recover

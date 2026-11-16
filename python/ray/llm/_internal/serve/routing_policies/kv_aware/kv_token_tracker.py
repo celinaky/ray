@@ -18,6 +18,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     KV_TOKEN_METADATA_KEY,
     LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
     OUTSTANDING_EFFECTIVE_PREFILL_TOKENS,
+    PREFILL_DECAY_PUBLISH_INTERVAL_S,
     REQUEST_TRACKING_TTL_S,
     SESSION_AFFINITY_MODE,
 )
@@ -83,6 +84,21 @@ class RequestLifecycle:
     total_blocks: int = 0
     # Monotonic admission time, for the TTL eviction sweep.
     created_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class WorkerPrefillDecay:
+    """A worker's outstanding prefill tokens, drained at a fixed rate from
+    ``anchored_at`` when reported.
+
+    ``tokens`` is the full uncached prefill tokens of the worker's requests
+    still in prefill; elapsed time never changes it. Progress since
+    ``anchored_at`` is subtracted only when reporting.
+    """
+
+    tokens: int = 0
+    # Monotonic time from which the worker has drained its prefill tokens.
+    anchored_at: float = 0.0
 
 
 class WorkerSelection(TypedDict):
@@ -203,7 +219,16 @@ class KVTokenTracker:
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         serve_deployment_id: Optional[Any] = None,
         session_affinity_ttl_s: float = DEFAULT_SESSION_AFFINITY_TTL_S,
+        prefill_decay_tokens_per_second: float = 0.0,
     ):
+        if not (
+            math.isfinite(prefill_decay_tokens_per_second)
+            and prefill_decay_tokens_per_second >= 0
+        ):
+            raise ValueError(
+                "prefill_decay_tokens_per_second must be finite and non-negative, "
+                f"got {prefill_decay_tokens_per_second}."
+            )
         # The tracked LLMServer deployment id, passed in by the LLMRouter
         # that builds the tracker.
         self._serve_deployment_id = serve_deployment_id
@@ -229,6 +254,15 @@ class KVTokenTracker:
         self._requests: "OrderedDict[str, RequestLifecycle]" = OrderedDict()
         # Current workload snapshot, used by the autoscaler.
         self._outstanding_effective_prefill_tokens = 0
+        # Uncached prefill tokens each worker is assumed to drain per second,
+        # or None (configured as 0) for no decay. When set, the autoscaling
+        # snapshot reports outstanding prefill tokens minus each worker's
+        # modeled progress; routing is unaffected.
+        self._prefill_decay_tokens_per_s: Optional[float] = (
+            prefill_decay_tokens_per_second or None
+        )
+        self._prefill_decay_by_worker: Dict[int, WorkerPrefillDecay] = {}
+        self._prefill_decay_publish_task: Optional[asyncio.Task] = None
         self._autoscaling_metrics_callback: Optional[
             Callable[[Dict[str, int]], None]
         ] = None
@@ -353,15 +387,88 @@ class KVTokenTracker:
     def set_autoscaling_metrics_callback(
         self, callback: Callable[[Dict[str, int]], None]
     ) -> None:
-        """Set the local callback for router-owned autoscaling metrics."""
+        """Set the local callback for router-owned autoscaling metrics.
+
+        Must be called on the ingress event loop: with prefill decay enabled,
+        this starts the task that republishes the decaying snapshot.
+        """
         self._autoscaling_metrics_callback = callback
+        if (
+            self._prefill_decay_tokens_per_s is not None
+            and self._prefill_decay_publish_task is None
+        ):
+            self._prefill_decay_publish_task = asyncio.get_running_loop().create_task(
+                self._publish_decayed_snapshots()
+            )
+
+    async def _publish_decayed_snapshots(self) -> None:
+        """Republish the snapshot while decaying prefill tokens are outstanding;
+        lifecycle events alone publish only when the stored tokens change."""
+        while True:
+            await asyncio.sleep(PREFILL_DECAY_PUBLISH_INTERVAL_S)
+            if self._prefill_decay_by_worker:
+                self._publish_autoscaling_snapshot()
 
     def _get_autoscaling_snapshot(self) -> Dict[str, int]:
         return {
-            OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: (
-                self._outstanding_effective_prefill_tokens
-            ),
+            OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: self._get_reported_prefill_tokens(),
         }
+
+    def _get_reported_prefill_tokens(self) -> int:
+        """Outstanding prefill tokens, less each worker's modeled progress when
+        prefill decay is enabled."""
+        if self._prefill_decay_tokens_per_s is None:
+            return self._outstanding_effective_prefill_tokens
+        now = time.monotonic()
+        return sum(
+            math.ceil(max(0.0, decay.tokens - self._get_prefill_progress(decay, now)))
+            for decay in self._prefill_decay_by_worker.values()
+        )
+
+    def _get_prefill_progress(self, decay: WorkerPrefillDecay, now: float) -> float:
+        """Tokens ``decay``'s worker has drained since its anchor, capped at its
+        outstanding tokens so an idle stretch is not credited to later arrivals.
+        """
+        elapsed_s = max(0.0, now - decay.anchored_at)
+        return min(float(decay.tokens), elapsed_s * self._prefill_decay_tokens_per_s)
+
+    def _add_prefill_load(self, worker_id: int, tokens: int) -> None:
+        self._outstanding_effective_prefill_tokens += tokens
+        if self._prefill_decay_tokens_per_s is None or tokens <= 0:
+            return
+        now = time.monotonic()
+        decay = self._prefill_decay_by_worker.get(worker_id)
+        if decay is None:
+            self._prefill_decay_by_worker[worker_id] = WorkerPrefillDecay(
+                tokens=tokens, anchored_at=now
+            )
+            return
+        # Re-anchor at the capped progress first, so a worker that drained all
+        # its tokens starts draining the new request only from now.
+        progress = self._get_prefill_progress(decay, now)
+        decay.anchored_at = now - progress / self._prefill_decay_tokens_per_s
+        decay.tokens += tokens
+
+    def _remove_prefill_load(self, worker_id: int, tokens: int) -> None:
+        """Remove a request's full prefill tokens when it leaves prefill.
+
+        Modeled progress up to ``tokens`` is attributed to the removed request;
+        only progress beyond it carries over to the worker's other requests, so
+        the reported tokens drop by the request's remaining modeled tokens.
+        """
+        self._outstanding_effective_prefill_tokens -= tokens
+        if self._prefill_decay_tokens_per_s is None or tokens <= 0:
+            return
+        decay = self._prefill_decay_by_worker.get(worker_id)
+        if decay is None:
+            return
+        if decay.tokens <= tokens:
+            del self._prefill_decay_by_worker[worker_id]
+            return
+        now = time.monotonic()
+        carried_progress = max(0.0, self._get_prefill_progress(decay, now) - tokens)
+        decay.tokens -= tokens
+        decay.anchored_at = now - carried_progress / self._prefill_decay_tokens_per_s
 
     def _publish_autoscaling_snapshot(self) -> None:
         if self._autoscaling_metrics_callback is None:
@@ -514,6 +621,7 @@ class KVTokenTracker:
             state = self._requests.pop(request_id, None)
             if state is not None:
                 self._remove_autoscaling_load(state)
+        self._prefill_decay_by_worker.pop(worker_id, None)
         self._publish_autoscaling_snapshot()
         if self._svc is None:
             return
@@ -696,7 +804,7 @@ class KVTokenTracker:
             expected_output_tokens=expected_output_tokens,
             total_blocks=math.ceil(prompt_tokens / block_size),
         )
-        self._outstanding_effective_prefill_tokens += effective_prefill_tokens
+        self._add_prefill_load(worker_id, effective_prefill_tokens)
         self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
 
     async def on_lifecycle_events(self, events: List[tuple]) -> None:
@@ -729,7 +837,7 @@ class KVTokenTracker:
         if state is None or state.prefill_completed:
             return
         state.prefill_completed = True
-        self._outstanding_effective_prefill_tokens -= state.effective_prefill_tokens
+        self._remove_prefill_load(state.worker_id, state.effective_prefill_tokens)
         self._publish_autoscaling_snapshot()
         await self._svc.prefill_complete(request_id)
 
@@ -766,7 +874,7 @@ class KVTokenTracker:
     def _remove_autoscaling_load(self, state: RequestLifecycle) -> None:
         """Remove a request's outstanding prefill tokens if it is still in prefill."""
         if not state.prefill_completed:
-            self._outstanding_effective_prefill_tokens -= state.effective_prefill_tokens
+            self._remove_prefill_load(state.worker_id, state.effective_prefill_tokens)
 
     async def get_autoscaling_snapshot(self) -> Dict[str, int]:
         """Return this router replica's latest global LLM work estimate."""
@@ -871,6 +979,9 @@ def build_kv_token_tracker(
             KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
         ),
         serve_deployment_id=serve_deployment_id,
+        prefill_decay_tokens_per_second=router_kwargs.get(
+            "prefill_decay_tokens_per_second", 0.0
+        ),
     )
     set_kv_token_tracker(tracker)
     return tracker

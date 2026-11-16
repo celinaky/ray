@@ -20,6 +20,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     is_kv_aware,
 )
+from ray.llm._internal.serve.routing_policies.kv_aware import kv_token_tracker
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
     KVTokenTracker,
     get_worker_id,
@@ -133,6 +134,9 @@ class RecordingKVTokenTracker(KVTokenTracker):
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._outstanding_effective_prefill_tokens = 0
+        self._prefill_decay_tokens_per_s = None
+        self._prefill_decay_by_worker = {}
+        self._prefill_decay_publish_task = None
         self._autoscaling_metrics_callback = None
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
@@ -181,11 +185,14 @@ class RaisingActor:
 class LocalKVTokenTracker(KVTokenTracker):
     """Router-local KVTokenTracker with the event plane + Serve LongPoll stripped."""
 
-    def __init__(self, block_size):
+    def __init__(self, block_size, prefill_decay_tokens_per_second=None):
         self._block_size = block_size
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._outstanding_effective_prefill_tokens = 0
+        self._prefill_decay_tokens_per_s = prefill_decay_tokens_per_second
+        self._prefill_decay_by_worker = {}
+        self._prefill_decay_publish_task = None
         self._autoscaling_metrics_callback = None
         self._request_ids_by_worker = {}
         self._completed_request_ids = OrderedDict()
@@ -787,6 +794,116 @@ async def test_autoscaling_snapshot_tracks_request_phases():
     expected = {OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: 0}
     assert await actor.get_autoscaling_snapshot() == expected
     assert published[-1] == expected
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Drive the tracker's monotonic clock without touching asyncio's."""
+    clock = _FakeClock()
+    monkeypatch.setattr(kv_token_tracker, "time", clock)
+    return clock
+
+
+def _reported_prefill_tokens(tracker):
+    return tracker._get_autoscaling_snapshot()[OUTSTANDING_EFFECTIVE_PREFILL_TOKENS]
+
+
+@pytest.mark.asyncio
+async def test_prefill_decay_subtracts_progress_when_reporting(fake_clock):
+    actor = LocalKVTokenTracker(block_size=16, prefill_decay_tokens_per_second=10)
+    await reserve(actor, "a", 1, list(range(100)))
+    await reserve(actor, "b", 1, list(range(60)))
+    assert _reported_prefill_tokens(actor) == 160
+
+    # Decay is subtracted only when reporting; the stored total is unchanged.
+    fake_clock.now += 5
+    assert _reported_prefill_tokens(actor) == 110
+    assert actor._outstanding_effective_prefill_tokens == 160
+
+    # Completing "a" removes its full 100 tokens, and its 50 tokens of modeled
+    # progress with it, so the report drops by a's remaining 50 tokens.
+    await actor.on_prefill_complete("a")
+    assert _reported_prefill_tokens(actor) == 60
+    assert actor._outstanding_effective_prefill_tokens == 60
+
+    fake_clock.now += 3
+    assert _reported_prefill_tokens(actor) == 30
+    fake_clock.now += 100
+    assert _reported_prefill_tokens(actor) == 0
+
+    # Idle progress past the outstanding tokens is not credited to new work.
+    await reserve(actor, "c", 1, list(range(40)))
+    assert _reported_prefill_tokens(actor) == 40
+    fake_clock.now += 2
+    assert _reported_prefill_tokens(actor) == 20
+
+    # Out-of-order completion: progress beyond "c" carries over to "b", so the
+    # report stays continuous.
+    await actor.on_prefill_complete("c")
+    assert _reported_prefill_tokens(actor) == 20
+
+    # A request completed while still in prefill also leaves the decay state.
+    await actor.on_request_completed("b")
+    assert _reported_prefill_tokens(actor) == 0
+    assert actor._prefill_decay_by_worker == {}
+
+
+@pytest.mark.asyncio
+async def test_prefill_decay_is_per_worker(fake_clock):
+    actor = LocalKVTokenTracker(block_size=16, prefill_decay_tokens_per_second=10)
+    await reserve(actor, "a", 1, list(range(100)))
+    fake_clock.now += 2
+    await reserve(actor, "b", 2, list(range(100)))
+    fake_clock.now += 3
+    # Each worker drains at the configured rate from its own first arrival.
+    assert _reported_prefill_tokens(actor) == 50 + 70
+
+    actor.remove_worker(1)
+    await asyncio.gather(*actor._pending_tasks)
+    assert _reported_prefill_tokens(actor) == 70
+    assert set(actor._prefill_decay_by_worker) == {2}
+
+
+@pytest.mark.asyncio
+async def test_prefill_decay_republishes_snapshot(fake_clock, monkeypatch):
+    monkeypatch.setattr(kv_token_tracker, "PREFILL_DECAY_PUBLISH_INTERVAL_S", 0.01)
+    actor = LocalKVTokenTracker(block_size=16, prefill_decay_tokens_per_second=10)
+    published = []
+    actor.set_autoscaling_metrics_callback(published.append)
+    try:
+        await reserve(actor, "a", 1, list(range(100)))
+        assert published[-1] == {OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: 100}
+
+        # No lifecycle event arrives, but the periodic publish reports decay.
+        fake_clock.now += 4
+        expected = {OUTSTANDING_EFFECTIVE_PREFILL_TOKENS: 60}
+        for _ in range(100):
+            if published[-1] == expected:
+                break
+            await asyncio.sleep(0.01)
+        assert published[-1] == expected
+
+        # Nothing is republished once no prefill tokens are outstanding.
+        await actor.on_prefill_complete("a")
+        num_published = len(published)
+        await asyncio.sleep(0.05)
+        assert len(published) == num_published
+    finally:
+        actor._prefill_decay_publish_task.cancel()
+
+
+@pytest.mark.parametrize("rate", [-1, float("inf"), float("nan")])
+def test_prefill_decay_rejects_invalid_rate(rate):
+    with pytest.raises(ValueError, match="prefill_decay_tokens_per_second"):
+        KVTokenTracker(prefill_decay_tokens_per_second=rate)
 
 
 @pytest.mark.asyncio
