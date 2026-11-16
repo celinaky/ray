@@ -377,6 +377,93 @@ class TestLLMTokenAutoscalingPolicy:
 
         assert replicas == 10
 
+    @pytest.mark.parametrize(
+        "tokens, target, step, expected",
+        [
+            (100, 4, 1, 3),  # asks for 1, steps down one
+            (100, 4, 2, 2),  # asks for 1, steps down two
+            (300, 4, 2, 3),  # asks for 3, already within the step
+            (1000, 4, 1, 10),  # scale-up is not limited
+            (400, 4, 1, 4),  # no change
+        ],
+    )
+    def test_max_downscale_step_limits_each_downscale(
+        self, tokens, target, step, expected
+    ):
+        """Asks for at most `step` fewer replicas than the current target."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100, max_downscale_step=step
+        )
+
+        replicas, state = policy(
+            self._make_ctx(
+                prefill_by_handle={"a": float(tokens)}, target_num_replicas=target
+            )
+        )
+
+        assert replicas == expected
+        # The unlimited ask is still reported.
+        assert state[REQUIRED_REPLICAS] == math.ceil(tokens / 100)
+
+    def test_max_downscale_step_keeps_cooldown_hold(self):
+        """The cooldown still holds the target while a step limit is set."""
+        policy = LLMTokenAutoscalingPolicy(
+            target_prefill_tokens_per_replica=100,
+            post_downscale_cooldown_s=60,
+            max_downscale_step=1,
+        )
+
+        replicas, _ = policy(
+            self._make_ctx(
+                prefill_by_handle={"a": 100.0},
+                target_num_replicas=3,
+                current_time=120,
+                last_scale_down_time=100,
+            )
+        )
+
+        assert replicas == 3
+
+    def test_wrapped_max_downscale_step_removes_one_replica_per_delay(
+        self, monkeypatch
+    ):
+        """Through Serve's delay logic, each accepted downscale removes one replica."""
+        policy = _apply_autoscaling_config(
+            LLMTokenAutoscalingPolicy(
+                target_prefill_tokens_per_replica=100, max_downscale_step=1
+            )
+        )
+        config = AutoscalingConfig(
+            min_replicas=1, max_replicas=100, downscale_delay_s=10
+        )
+        state, target, history = {}, 4, []
+        for now in range(100, 140, 2):
+            monkeypatch.setattr("ray.serve.autoscaling_policy.time.time", lambda: now)
+            replicas, state = policy(
+                self._make_ctx(
+                    prefill_by_handle={"a": 50.0},
+                    config=config,
+                    target_num_replicas=target,
+                    current_time=now,
+                    policy_state=state,
+                )
+            )
+            if replicas != target:
+                history.append((now, target, replicas))
+                target = replicas
+
+        assert [(a, b) for _, a, b in history] == [(4, 3), (3, 2), (2, 1)]
+        times = [t for t, _, _ in history]
+        assert all(b - a >= 10 for a, b in zip(times, times[1:]))
+
+    @pytest.mark.parametrize("step", [0, -1, 1.5, True])
+    def test_rejects_invalid_max_downscale_step(self, step):
+        """Rejects a step that is not a positive integer."""
+        with pytest.raises(ValueError, match="max_downscale_step"):
+            LLMTokenAutoscalingPolicy(
+                target_prefill_tokens_per_replica=100, max_downscale_step=step
+            )
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))
